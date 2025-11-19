@@ -1,0 +1,33 @@
+data:
+  results_csv: data/raw/epl_combined.csv
+  features_csv: data/processed/features.csv
+
+model:
+  dc:
+    rho_init: 0.0
+    max_iter: 300
+    tol: 1.0e-06
+    home_adv_init: 0.1
+  elo:
+    k_factor: 18.0
+    home_advantage: 55.0
+  ensemble:
+    w_dc: 0.6
+    w_elo: 0.4
+
+train:
+  test_start_season: 2024
+
+orchestrator:
+  output_dir: models/predictions
+
+tuning:
+  low_score_threshold: 2
+  low_score_tolerance: 0.05
+  home_win_tolerance: 0.03
+  k_step: 2.0
+  rho_step: 0.02
+  home_adv_step: 5.0
+  w_step: 0.05
+
+seed: 1337
