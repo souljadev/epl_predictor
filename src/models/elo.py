@@ -36,3 +36,70 @@ class EloModel:
         p_home = np.clip(p_home, 0, 1)
         Z = p_home + p_draw + p_away
         return p_home/Z, p_draw/Z, p_away/Z
+
+    def __init__(self, k_factor=20, home_advantage=55):
+        self.k = k_factor              # Update rate
+        self.home_adv = home_advantage # Elo home advantage in points
+
+    # ----------------------------------------------------
+    # REQUIRED BY backtest_fast()
+    # ----------------------------------------------------
+    def init_ratings(self, teams, initial_rating=1500):
+        """
+        Initialize ratings for all teams once at the start.
+        """
+        return {team: initial_rating for team in teams}
+
+    # ----------------------------------------------------
+    def expected_result(self, Ra, Rb, is_home):
+        """
+        Expected result using Elo logistic curve.
+        """
+        ha = self.home_adv if is_home else 0   # Home advantage in Elo points
+        return 1 / (1 + 10 ** (-(Ra + ha - Rb) / 400))
+
+    # ----------------------------------------------------
+    def predict_win_probs_raw(self, ratings, home, away):
+        """
+        Returns win/draw/loss probabilities using Elo goal expectation scaling.
+        """
+        Ra = ratings[home]
+        Rb = ratings[away]
+
+        p_home = self.expected_result(Ra, Rb, is_home=True)
+        p_away = self.expected_result(Rb, Ra, is_home=False)
+
+        # Draw probability heuristic
+        p_draw = max(0, 1 - (p_home + p_away))
+        p_draw = min(p_draw, 0.35)  # usually ~20–30%
+
+        return {"H": p_home, "D": p_draw, "A": p_away}
+
+    # ----------------------------------------------------
+    # REQUIRED BY backtest_fast()
+    # ----------------------------------------------------
+    def update_ratings_match(self, ratings, home, away, FTHG, FTAG):
+        """
+        Update Elo ratings after seeing the actual match result.
+        """
+
+        Ra = ratings[home]
+        Rb = ratings[away]
+
+        # Actual result
+        if FTHG > FTAG:
+            Sa, Sb = 1, 0
+        elif FTHG < FTAG:
+            Sa, Sb = 0, 1
+        else:
+            Sa, Sb = 0.5, 0.5
+
+        # Expected results
+        Ea = self.expected_result(Ra, Rb, is_home=True)
+        Eb = 1 - Ea
+
+        # Elo updates
+        ratings[home] = Ra + self.k * (Sa - Ea)
+        ratings[away] = Rb + self.k * (Sb - Eb)
+
+        return ratings
