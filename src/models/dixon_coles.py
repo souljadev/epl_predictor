@@ -4,7 +4,7 @@ from math import exp
 
 class DixonColesModel:
     """
-    Incremental Dixon–Coles style model.
+    Incremental Dixon–Coles style model with optional xG training.
 
     Maintains:
       - team attack strengths
@@ -13,11 +13,11 @@ class DixonColesModel:
       - rho (low-scoring correlation factor)
 
     Supports:
-      - update(home, away, FTHG, FTAG)
-      - predict_expected_goals(home, away) -> (lam_home, lam_away)
-      - predict(home, away) -> (pH, pD, pA)
-      - fit(df)  # for expanding backtest
-      - match_probs(home, away) -> {"lambdas": (lamH, lamA), "win_probs": {"H","D","A"}}
+      - update(home, away, FTHG, FTAG)          # goal-based incremental update
+      - predict_expected_goals(home, away)     # λ_home, λ_away
+      - predict(home, away) -> (pH, pD, pA)    # 1X2 probabilities
+      - fit(df)                                # trains on df, using xG when available
+      - match_probs(home, away) -> dict with lambdas + win_probs
     """
 
     def __init__(self, rho_init=0.0, home_adv_init=0.15, lr=0.05):
@@ -30,7 +30,7 @@ class DixonColesModel:
     # ------------------------------
     # Internal helpers
     # ------------------------------
-    def _init_team(self, team):
+    def _init_team(self, team: str):
         if team not in self.attack:
             self.attack[team] = 0.0
         if team not in self.defense:
@@ -39,7 +39,7 @@ class DixonColesModel:
     @staticmethod
     def _rho_adjust(home_goals, away_goals, lam_h, lam_a, rho):
         """
-        Standard Dixon–Coles rho adjustment for low scores.
+        Dixon–Coles rho adjustment for low scoring outcomes.
         """
         if home_goals == 0 and away_goals == 0:
             return 1 - (lam_h * lam_a * rho)
@@ -63,6 +63,10 @@ class DixonColesModel:
     def update(self, home, away, home_goals, away_goals):
         """
         Single-match incremental update using a simple gradient-like step.
+
+        NOTE: home_goals / away_goals can be:
+          - actual goals (0,1,2,...)
+          - OR xG values (float) if you want to call this with xG.
         """
         self._init_team(home)
         self._init_team(away)
@@ -70,7 +74,7 @@ class DixonColesModel:
         lam_h = exp(self.attack[home] - self.defense[away] + self.home_adv)
         lam_a = exp(self.attack[away] - self.defense[home])
 
-        # Gradients (log-likelihood style)
+        # Gradients (log-likelihood style, works with real or fractional "goals")
         grad_attack_home = home_goals - lam_h
         grad_defense_away = lam_h - home_goals
 
@@ -84,30 +88,53 @@ class DixonColesModel:
         self.attack[away] += self.lr * grad_attack_away
         self.defense[home] += self.lr * grad_defense_home
 
-        # Light rho update based on low-scoring correlation
+        # Light rho update for low-scoring correlation
         if home_goals <= 1 and away_goals <= 1:
             target_rho = 1.0 if home_goals == away_goals else -1.0
             self.rho += 0.01 * (target_rho - self.rho)
 
     # ------------------------------
-    # Fit over a dataframe (expanding backtest)
+    # Fit over a dataframe (uses xG if present)
     # ------------------------------
-    def fit(self, df):
+    def fit(self, df, use_xg: bool = True,
+            home_xg_col: str = "Home_xG",
+            away_xg_col: str = "Away_xG"):
         """
         Fit the model over a historical dataframe.
 
-        Expects columns: HomeTeam, AwayTeam, FTHG, FTAG
+        Expects at least:
+          - HomeTeam, AwayTeam, FTHG, FTAG
+        If use_xg is True and Home_xG / Away_xG exist and are non-NaN,
+        they are used instead of FTHG / FTAG as the "target goals".
         """
+
         # Sort by date if Date exists
         if "Date" in df.columns:
             df = df.sort_values("Date")
 
+        has_xg_cols = (
+            use_xg and
+            home_xg_col in df.columns and
+            away_xg_col in df.columns
+        )
+
         for _, row in df.iterrows():
             home = row["HomeTeam"]
             away = row["AwayTeam"]
-            FTHG = int(row["FTHG"])
-            FTAG = int(row["FTAG"])
-            self.update(home, away, FTHG, FTAG)
+
+            # default targets = actual goals
+            tgt_home = float(row["FTHG"])
+            tgt_away = float(row["FTAG"])
+
+            # if xG available & not NaN, override
+            if has_xg_cols:
+                hxg = row[home_xg_col]
+                axg = row[away_xg_col]
+                if not (np.isnan(hxg) or np.isnan(axg)):
+                    tgt_home = float(hxg)
+                    tgt_away = float(axg)
+
+            self.update(home, away, tgt_home, tgt_away)
 
         return self
 

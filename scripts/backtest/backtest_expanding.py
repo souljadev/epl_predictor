@@ -24,7 +24,7 @@ print("DC loaded from:", inspect.getfile(DixonColesModel))
 CONFIG_PATH = ROOT / "config.yaml"
 RESUME_PATH = ROOT / "models" / "history" / "backtest_expanding_resume.txt"
 
-BACKTEST_START_DATE = pd.Timestamp("2015-01-01")
+BACKTEST_START_DATE = pd.Timestamp("2018-01-01")
 MIN_TRAIN_MATCHES = 200
 
 
