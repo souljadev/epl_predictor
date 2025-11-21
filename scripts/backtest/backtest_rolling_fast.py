@@ -16,11 +16,12 @@ from models.ensemble import ensemble_win_probs
 CONFIG_PATH = ROOT / "config.yaml"
 OUT_DIR = ROOT / "models" / "history"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-OUT_PATH = OUT_DIR / "backtest_expanding_matchday.csv"
+OUT_PATH = OUT_DIR / "backtest_rolling_fast.csv"
 
 # You can tweak these if you want
 BACKTEST_START_DATE = pd.Timestamp("2016-08-01")
-MIN_TRAIN_MATCHES = 200
+ROLLING_WINDOW_DAYS = 730  # 2-year rolling window
+MIN_TRAIN_MATCHES = 100
 
 
 def load_config():
@@ -39,9 +40,9 @@ def outcome_label(hg, ag):
     return "D"
 
 
-def backtest_expanding(config=None):
+def backtest_rolling_fast(config=None):
     start_global = time.time()
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Starting EXPANDING MATCHDAY backtest")
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Starting FAST ROLLING backtest")
 
     cfg = config or load_config()
     results_path = ROOT / cfg["data"]["results_csv"]
@@ -70,7 +71,7 @@ def backtest_expanding(config=None):
         return
 
     unique_dates = sorted(df["Date"].unique())
-    print(f"Total match dates (expanding): {len(unique_dates)}")
+    print(f"Total match dates (rolling_fast): {len(unique_dates)}")
 
     # Model config
     dc_cfg = cfg.get("model", {}).get("dc", {})
@@ -81,8 +82,10 @@ def backtest_expanding(config=None):
     for i, date in enumerate(unique_dates):
         day_matches = df[df["Date"] == date]
 
-        # Training data: ALL matches before current date (expanding window)
-        history = df[df["Date"] < date].dropna(subset=["FTHG", "FTAG"])
+        # Rolling training window: last N days before this date
+        window_start = date - pd.Timedelta(days=ROLLING_WINDOW_DAYS)
+        history = df[(df["Date"] < date) & (df["Date"] >= window_start)]
+        history = history.dropna(subset=["FTHG", "FTAG"])
         if len(history) < MIN_TRAIN_MATCHES:
             continue
 
@@ -153,17 +156,17 @@ def backtest_expanding(config=None):
             )
 
     if not rows:
-        print("⚠ Expanding backtest produced no rows.")
+        print("⚠ Rolling FAST produced no rows.")
         return
 
     eval_df = pd.DataFrame(rows).sort_values("Date")
     eval_df.to_csv(OUT_PATH, index=False)
 
     total_elapsed = time.time() - start_global
-    print(f"\nSaved expanding matchday backtest → {OUT_PATH}")
+    print(f"\nSaved FAST rolling backtest → {OUT_PATH}")
     print(f"⏱ Total runtime: {total_elapsed/60:.2f} minutes")
     print(f"Total matches evaluated: {len(eval_df)}")
 
 
 if __name__ == "__main__":
-    backtest_expanding()
+    backtest_rolling_fast()
