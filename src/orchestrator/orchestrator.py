@@ -1,16 +1,25 @@
 import logging
 from pathlib import Path
 import math
-from collections import defaultdict
+from collections import defaultdict  # kept in case of future use
 
 import pandas as pd
 import yaml
 
+from ..models.dixon_coles import DixonColesModel
+from ..models.elo import EloModel
+from ..models.ensemble import ensemble_win_probs
+
 
 class Orchestrator:
     """
-    Orchestrator for training Poisson + Elo models and generating
+    Orchestrator for training Dixon–Coles + Elo models and generating
     full betting markets + exact score predictions.
+
+    This version is aligned with the backtest pipelines:
+      - Uses xG-enhanced Dixon–Coles for expected goals and 1X2
+      - Uses the EloModel class for 1X2 probabilities
+      - Ensembles them with the same weights as backtests
     """
 
     def __init__(self, config_path: str):
@@ -25,26 +34,26 @@ class Orchestrator:
         )
 
         model_cfg = self.config.get("model", {})
+        self.dc_cfg = model_cfg.get("dc", {})
         self.elo_cfg = model_cfg.get("elo", {})
         self.ensemble_cfg = model_cfg.get("ensemble", {"w_dc": 0.6, "w_elo": 0.4})
 
+        orch_cfg = self.config.get("orchestrator", {})
+        self.output_dir = Path(orch_cfg.get("output_dir", "models/predictions"))
+        # Train start date: default to xG era (2018-01-01) if not provided
+        self.train_start_date_str = orch_cfg.get("train_start_date", "2018-01-01")
+
         # Model state
         self.results_df: pd.DataFrame | None = None
-        self.league_home_goals: float | None = None
-        self.league_away_goals: float | None = None
-        self.draw_rate: float | None = None
-        self.attack_home: dict[str, float] = {}
-        self.defence_home: dict[str, float] = {}
-        self.attack_away: dict[str, float] = {}
-        self.defence_away: dict[str, float] = {}
-        self.elo_ratings: dict[str, float] = {}
+        self.dc_model: DixonColesModel | None = None
+        self.elo_model: EloModel | None = None
 
         logging.info(f"Loaded config from {self.config_path}")
 
         # Initial training
         self._load_results()
-        self._fit_poisson_model()
-        self._fit_elo_model()
+        self._fit_poisson_model()  # now fits Dixon–Coles
+        self._fit_elo_model()      # fits EloModel
 
     # =====================================================================
     # CONFIG + DATA LOADING
@@ -98,105 +107,105 @@ class Orchestrator:
                 pass
 
         self.results_df = df.reset_index(drop=True)
-        logging.info(f"Loaded {len(self.results_df)} cleaned matches.")
+        logging.info(f"Loaded {len(self.results_df)} historical matches.")
 
     # =====================================================================
-    # POISSON / DIXON-COLES STYLE MODEL
+    # DIXON–COLES MODEL (re-using legacy name _fit_poisson_model)
     # =====================================================================
     def _fit_poisson_model(self) -> None:
+        """
+        Fit the xG-based Dixon–Coles model on historical data.
+
+        We keep the legacy name `_fit_poisson_model` so that existing
+        calls from `train()` and __init__ still work unchanged.
+        """
+        if self.results_df is None:
+            raise RuntimeError("Results dataframe not loaded.")
+
         df = self.results_df
-        assert df is not None
 
-        # League averages
-        self.league_home_goals = float(df["FTHG"].mean())
-        self.league_away_goals = float(df["FTAG"].mean())
-        self.draw_rate = float((df["FTHG"] == df["FTAG"]).mean())
+        # Optional training window aligned with backtests
+        if "Date" in df.columns and self.train_start_date_str:
+            try:
+                cutoff = pd.to_datetime(self.train_start_date_str)
+                df = df[df["Date"] >= cutoff].copy()
+                logging.info(
+                    f"Training Dixon–Coles on matches from {cutoff.date()} onward "
+                    f"({len(df)} matches)."
+                )
+            except Exception as e:
+                logging.warning(f"Could not parse train_start_date: {e}")
 
-        teams = pd.unique(df[["HomeTeam", "AwayTeam"]].values.ravel())
+        # Instantiate and fit Dixon–Coles
+        rho_init = float(self.dc_cfg.get("rho_init", 0.0))
+        home_adv_init = float(self.dc_cfg.get("home_adv_init", 0.15))
+        lr = float(self.dc_cfg.get("lr", 0.05))
 
-        home_scored = defaultdict(float)
-        home_conceded = defaultdict(float)
-        home_games = defaultdict(int)
+        dc = DixonColesModel(
+            rho_init=rho_init,
+            home_adv_init=home_adv_init,
+            lr=lr,
+        )
 
-        away_scored = defaultdict(float)
-        away_conceded = defaultdict(float)
-        away_games = defaultdict(int)
+        # Use xG if available, otherwise fall back to goals
+        dc.fit(df, use_xg=True, home_xg_col="Home_xG", away_xg_col="Away_xG")
 
-        for _, r in df.iterrows():
-            h = r["HomeTeam"]
-            a = r["AwayTeam"]
-            hg = float(r["FTHG"])
-            ag = float(r["FTAG"])
+        self.dc_model = dc
+        logging.info("Fitted xG-based Dixon–Coles model.")
 
-            home_scored[h] += hg
-            home_conceded[h] += ag
-            home_games[h] += 1
+    # =====================================================================
+    # ELO MODEL
+    # =====================================================================
+    def _fit_elo_model(self) -> None:
+        if self.results_df is None:
+            raise RuntimeError("Results dataframe not loaded.")
 
-            away_scored[a] += ag
-            away_conceded[a] += hg
-            away_games[a] += 1
+        df = self.results_df
 
-        # Compute attack/defence strengths
-        for t in teams:
-            if home_games[t] > 0:
-                self.attack_home[t] = (
-                    home_scored[t] / home_games[t]
-                ) / self.league_home_goals
-                self.defence_home[t] = (
-                    home_conceded[t] / home_games[t]
-                ) / self.league_away_goals
-            else:
-                self.attack_home[t] = 1.0
-                self.defence_home[t] = 1.0
+        # Same training window as DC
+        if "Date" in df.columns and self.train_start_date_str:
+            try:
+                cutoff = pd.to_datetime(self.train_start_date_str)
+                df = df[df["Date"] >= cutoff].copy()
+                logging.info(
+                    f"Training Elo on matches from {cutoff.date()} onward "
+                    f"({len(df)} matches)."
+                )
+            except Exception as e:
+                logging.warning(f"Could not parse train_start_date for Elo: {e}")
 
-            if away_games[t] > 0:
-                self.attack_away[t] = (
-                    away_scored[t] / away_games[t]
-                ) / self.league_away_goals
-                self.defence_away[t] = (
-                    away_conceded[t] / away_games[t]
-                ) / self.league_home_goals
-            else:
-                self.attack_away[t] = 1.0
-                self.defence_away[t] = 1.0
+        k_factor = float(self.elo_cfg.get("k_factor", 18.0))
+        home_adv = float(self.elo_cfg.get("home_advantage", 55.0))
 
-        # Clean up NaNs / infs
-        for d in [
-            self.attack_home,
-            self.defence_home,
-            self.attack_away,
-            self.defence_away,
-        ]:
-            for tm in d:
-                if pd.isna(d[tm]) or math.isinf(d[tm]):
-                    d[tm] = 1.0
+        elo = EloModel(k_factor=k_factor, home_advantage=home_adv)
+        elo.fit(df)
 
-        logging.info("Fitted Poisson attack/defense strengths.")
+        self.elo_model = elo
+        logging.info("Fitted Elo ratings via EloModel.")
 
+    # =====================================================================
+    # POISSON UTILITIES (for exact score matrix)
+    # =====================================================================
     @staticmethod
     def _poisson(k: int, lam: float) -> float:
-        return math.exp(-lam) * (lam**k) / math.factorial(k)
+        return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
     def _expected_goals(self, home: str, away: str) -> tuple[float, float]:
-        """Return expected goals (lambda_home, lambda_away) from Poisson model."""
-        λH = (
-            self.league_home_goals
-            * self.attack_home.get(home, 1.0)
-            * self.defence_away.get(away, 1.0)
-        )
-        λA = (
-            self.league_away_goals
-            * self.attack_away.get(away, 1.0)
-            * self.defence_home.get(home, 1.0)
-        )
+        """
+        Return expected goals (lambda_home, lambda_away) from the
+        xG-trained Dixon–Coles model.
+        """
+        if self.dc_model is None:
+            raise RuntimeError("Dixon–Coles model not fitted.")
+        λH, λA = self.dc_model.predict_expected_goals(home, away)
         return float(λH), float(λA)
 
     def _exact_score_matrix(
         self, home: str, away: str, max_goals: int = 6
     ) -> dict[tuple[int, int], float]:
         """
-        Return dict[(home_goals, away_goals)] -> probability,
-        normalized to sum to 1.
+        Build exact score probability matrix using Poisson with
+        λH, λA from Dixon–Coles.
         """
         λH, λA = self._expected_goals(home, away)
         matrix: dict[tuple[int, int], float] = {}
@@ -211,98 +220,32 @@ class Orchestrator:
             for k in matrix:
                 matrix[k] /= total
         else:
-            # Fallback: uniform tiny probabilities if everything broke
-            n = (max_goals + 1) ** 2
-            matrix = {(hg, ag): 1.0 / n for hg in range(max_goals + 1) for ag in range(max_goals + 1)}
-
+            # Degenerate fallback: give 0-0 full mass
+            matrix = {(0, 0): 1.0}
         return matrix
 
     def _poisson_match_probs(
         self, home: str, away: str, max_goals: int = 6
     ) -> tuple[float, float, float]:
         """
-        Aggregate Poisson exact-score matrix into 1X2 probabilities.
+        Return 1X2 probabilities from the Dixon–Coles model.
+
+        We keep the legacy name `_poisson_match_probs` so that the
+        surrounding code doesn't need to change.
         """
-        λH, λA = self._expected_goals(home, away)
-
-        p_home = 0.0
-        p_draw = 0.0
-        p_away = 0.0
-
-        for hg in range(max_goals + 1):
-            for ag in range(max_goals + 1):
-                p = self._poisson(hg, λH) * self._poisson(ag, λA)
-                if hg > ag:
-                    p_home += p
-                elif hg == ag:
-                    p_draw += p
-                else:
-                    p_away += p
-
-        total = p_home + p_draw + p_away
-        if total > 0:
-            return p_home / total, p_draw / total, p_away / total
-        # Fallback equal split if something degenerate happens
-        return 1.0 / 3, 1.0 / 3, 1.0 / 3
+        if self.dc_model is None:
+            raise RuntimeError("Dixon–Coles model not fitted.")
+        pH, pD, pA = self.dc_model.predict(home, away, max_goals=max_goals)
+        return float(pH), float(pD), float(pA)
 
     # =====================================================================
-    # ELO MODEL
+    # ELO PROBS
     # =====================================================================
-    def _fit_elo_model(self) -> None:
-        df = self.results_df
-        assert df is not None
-
-        k_factor = float(self.elo_cfg.get("k_factor", 18.0))
-        home_adv = float(self.elo_cfg.get("home_advantage", 55.0))
-
-        teams = pd.unique(df[["HomeTeam", "AwayTeam"]].values.ravel())
-        ratings = {t: 1500.0 for t in teams}
-
-        for _, r in df.iterrows():
-            h = r["HomeTeam"]
-            a = r["AwayTeam"]
-            hg = float(r["FTHG"])
-            ag = float(r["FTAG"])
-
-            rh = ratings[h]
-            ra = ratings[a]
-
-            diff = (rh + home_adv) - ra
-            exp_home = 1.0 / (1.0 + 10.0 ** (-diff / 400.0))
-
-            if hg > ag:
-                s_home = 1.0
-            elif hg == ag:
-                s_home = 0.5
-            else:
-                s_home = 0.0
-
-            ratings[h] = rh + k_factor * (s_home - exp_home)
-            ratings[a] = ra + k_factor * ((1.0 - s_home) - (1.0 - exp_home))
-
-        self.elo_ratings = ratings
-        logging.info("Fitted Elo ratings.")
-
     def _elo_probs(self, home: str, away: str) -> tuple[float, float, float]:
-        rh = self.elo_ratings.get(home, 1500.0)
-        ra = self.elo_ratings.get(away, 1500.0)
-        home_adv = float(self.elo_cfg.get("home_advantage", 55.0))
-
-        diff = (rh + home_adv) - ra
-        p_home_raw = 1.0 / (1.0 + 10.0 ** (-diff / 400.0))
-        p_away_raw = 1.0 - p_home_raw
-
-        draw_rate = self.draw_rate if self.draw_rate is not None else 0.25
-        scale = 1.0 - draw_rate
-
-        p_home = p_home_raw * scale
-        p_away = p_away_raw * scale
-        p_draw = draw_rate
-
-        total = p_home + p_draw + p_away
-        if total > 0:
-            return p_home / total, p_draw / total, p_away / total
-        return 1.0 / 3, 1.0 / 3, 1.0 / 3
+        if self.elo_model is None:
+            raise RuntimeError("Elo model not fitted.")
+        pH, pD, pA = self.elo_model.predict(home, away)
+        return float(pH), float(pD), float(pA)
 
     # =====================================================================
     # PUBLIC API: TRAIN + PREDICT
@@ -311,7 +254,7 @@ class Orchestrator:
         """
         Re-train models from historical data.
         """
-        logging.info("Re-training Poisson + Elo models...")
+        logging.info("Re-training Dixon–Coles + Elo models...")
         self._load_results()
         self._fit_poisson_model()
         self._fit_elo_model()
@@ -346,29 +289,24 @@ class Orchestrator:
             away = r["AwayTeam"]
             date = r.get("Date", "")
 
-            # Poisson 1X2 probabilities
+            # Dixon–Coles 1X2 probabilities
             pH_dc, pD_dc, pA_dc = self._poisson_match_probs(home, away)
 
             # Elo 1X2 probabilities
             pH_elo, pD_elo, pA_elo = self._elo_probs(home, away)
 
-            # Ensemble
-            pH = w_dc * pH_dc + w_elo * pH_elo
-            pD = w_dc * pD_dc + w_elo * pD_elo
-            pA = w_dc * pA_dc + w_elo * pA_elo
+            # Ensemble (using shared helper)
+            pH, pD, pA = ensemble_win_probs(
+                (pH_dc, pD_dc, pA_dc),
+                (pH_elo, pD_elo, pA_elo),
+                w_dc=w_dc,
+                w_elo=w_elo,
+            )
 
-            total = pH + pD + pA
-            if total > 0:
-                pH /= total
-                pD /= total
-                pA /= total
-            else:
-                pH = pD = pA = 1.0 / 3
-
-            # Exact score matrix (from Poisson)
+            # Exact score matrix from Poisson with DC lambdas
             matrix = self._exact_score_matrix(home, away, max_goals=6)
 
-            # Most likely exact score
+            # Most likely score
             best_score = max(matrix, key=matrix.get)
             best_prob = matrix[best_score]
 
@@ -389,7 +327,7 @@ class Orchestrator:
             dc_x2 = pD + pA  # draw or away
             dc_12 = pH + pA  # either side wins
 
-            # Expected goals from Poisson
+            # Expected goals
             λH, λA = self._expected_goals(home, away)
             exp_total_goals = λH + λA
 
@@ -416,7 +354,7 @@ class Orchestrator:
                 }
             )
 
-            # All exact scores
+            # Exact scores rows
             for (hg, ag), prob in matrix.items():
                 exact_rows.append(
                     {
@@ -429,21 +367,14 @@ class Orchestrator:
                 )
 
         # Output paths
-        out_dir = Path(
-            self.config.get("orchestrator", {}).get(
-                "output_dir", "models/predictions"
-            )
-        )
+        out_dir = self.output_dir
         out_dir.mkdir(parents=True, exist_ok=True)
-
-        full_df = pd.DataFrame(full_rows)
-        exact_df = pd.DataFrame(exact_rows)
 
         full_path = out_dir / "predictions_full.csv"
         exact_path = out_dir / "predictions_exact_scores.csv"
 
-        full_df.to_csv(full_path, index=False)
-        exact_df.to_csv(exact_path, index=False)
+        pd.DataFrame(full_rows).to_csv(full_path, index=False)
+        pd.DataFrame(exact_rows).to_csv(exact_path, index=False)
 
-        logging.info(f"Saved full markets to {full_path}")
-        logging.info(f"Saved exact score matrix to {exact_path}")
+        logging.info(f"Wrote full predictions to: {full_path}")
+        logging.info(f"Wrote exact-score predictions to: {exact_path}")
