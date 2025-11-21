@@ -1,105 +1,188 @@
-import pandas as pd
 import numpy as np
 
+
 class EloModel:
-    def __init__(self, k_factor=18.0, home_advantage=55.0):
+    """
+    Enhanced Elo model for football (soccer).
+
+    Features:
+    - Adaptive K: larger updates for surprising results.
+    - Margin sensitivity: bigger rating changes for multi-goal wins.
+    - Dynamic draw probability: increases for evenly matched teams.
+    - Fully compatible with fast incremental training (backtest_fast.py).
+    """
+
+    def __init__(
+        self,
+        k_factor: float = 18.0,
+        home_advantage: float = 55.0,
+        base_rating: float = 1500.0,
+        draw_base: float = 0.25,
+        draw_max_extra: float = 0.10,
+        draw_scale: float = 400.0,
+    ):
+        """
+        Parameters
+        ----------
+        k_factor : float
+            Base K for Elo updates.
+        home_advantage : float
+            Home advantage added to the home team's rating.
+        base_rating : float
+            Default Elo for new teams.
+        draw_base : float
+            Baseline draw probability.
+        draw_max_extra : float
+            Maximum extra draw probability when evenly matched.
+        draw_scale : float
+            Rating-difference scaling factor for draw bump.
+        """
         self.k = k_factor
         self.home_adv = home_advantage
-        self.ratings = {}
+        self.base_rating = base_rating
 
-    def _get(self, team):
-        return self.ratings.get(team, 1500.0)
+        # Draw model
+        self.draw_base = draw_base
+        self.draw_max_extra = draw_max_extra
+        self.draw_scale = draw_scale
 
-    def fit(self, results_df: pd.DataFrame):
-        teams = sorted(set(results_df["HomeTeam"]).union(results_df["AwayTeam"]))
-        for t in teams:
-            self.ratings.setdefault(t, 1500.0)
-        for _, row in results_df.sort_values("Date").iterrows():
-            h, a = row["HomeTeam"], row["AwayTeam"]
-            gh, ga = row["FTHG"], row["FTAG"]
-            ra_h = self._get(h) + self.home_adv
-            ra_a = self._get(a)
-            exp_h = 1/(1+10**((ra_a - ra_h)/400))
-            if gh>ga: s_h = 1.0
-            elif gh==ga: s_h = 0.5
-            else: s_h = 0.0
-            self.ratings[h] = self._get(h) + self.k*(s_h - exp_h)
-            self.ratings[a] = self._get(a) + self.k*((1-s_h) - (1-exp_h))
-        return self
+        # Ratings dict populated during updates
+        self.ratings: dict[str, float] = {}
 
-    def predict_win_probs(self, home, away):
-        ra_h = self._get(home) + self.home_adv
-        ra_a = self._get(away)
-        p_home = 1/(1+10**((ra_a - ra_h)/400))
-        p_draw = 0.24
-        p_away = max(0.0, 1 - p_home - p_draw)
-        p_home = np.clip(p_home, 0, 1)
-        Z = p_home + p_draw + p_away
-        return p_home/Z, p_draw/Z, p_away/Z
+    # ------------------------------------------------------------------ #
+    # Rating Utilities
+    # ------------------------------------------------------------------ #
 
-    def __init__(self, k_factor=20, home_advantage=55):
-        self.k = k_factor              # Update rate
-        self.home_adv = home_advantage # Elo home advantage in points
+    def _get_rating(self, team):
+        return self.ratings.get(team, self.base_rating)
 
-    # ----------------------------------------------------
-    # REQUIRED BY backtest_fast()
-    # ----------------------------------------------------
-    def init_ratings(self, teams, initial_rating=1500):
-        """
-        Initialize ratings for all teams once at the start.
-        """
-        return {team: initial_rating for team in teams}
+    def _ensure_team(self, team):
+        if team not in self.ratings:
+            self.ratings[team] = float(self.base_rating)
 
-    # ----------------------------------------------------
-    def expected_result(self, Ra, Rb, is_home):
-        """
-        Expected result using Elo logistic curve.
-        """
-        ha = self.home_adv if is_home else 0   # Home advantage in Elo points
-        return 1 / (1 + 10 ** (-(Ra + ha - Rb) / 400))
+    def expected_home_prob(self, R_home: float, R_away: float) -> float:
+        """Expected home win prob in a 2-outcome setup (no draw)."""
+        diff = (R_home + self.home_adv) - R_away
+        return 1.0 / (1.0 + 10.0 ** (-diff / 400.0))
 
-    # ----------------------------------------------------
-    def predict_win_probs_raw(self, ratings, home, away):
-        """
-        Returns win/draw/loss probabilities using Elo goal expectation scaling.
-        """
-        Ra = ratings[home]
-        Rb = ratings[away]
+    def margin_multiplier(self, goal_diff: int) -> float:
+        """Margin-of-victory multiplier."""
+        if goal_diff <= 1:
+            return 1.0
+        mult = 1.0 + (goal_diff - 1) * 0.075
+        return min(mult, 1.75)
 
-        p_home = self.expected_result(Ra, Rb, is_home=True)
-        p_away = self.expected_result(Rb, Ra, is_home=False)
+    # ------------------------------------------------------------------ #
+    # Core Rating Update Logic
+    # ------------------------------------------------------------------ #
 
-        # Draw probability heuristic
-        p_draw = max(0, 1 - (p_home + p_away))
-        p_draw = min(p_draw, 0.35)  # usually ~20–30%
-
-        return {"H": p_home, "D": p_draw, "A": p_away}
-
-    # ----------------------------------------------------
-    # REQUIRED BY backtest_fast()
-    # ----------------------------------------------------
     def update_ratings_match(self, ratings, home, away, FTHG, FTAG):
-        """
-        Update Elo ratings after seeing the actual match result.
-        """
+        """Internal Elo update for a single match."""
+        R_home = ratings[home]
+        R_away = ratings[away]
 
-        Ra = ratings[home]
-        Rb = ratings[away]
+        # Expected home win probability
+        exp_home = self.expected_home_prob(R_home, R_away)
+        exp_away = 1.0 - exp_home
 
-        # Actual result
+        # Actual match result
         if FTHG > FTAG:
-            Sa, Sb = 1, 0
+            S_home, S_away = 1.0, 0.0
         elif FTHG < FTAG:
-            Sa, Sb = 0, 1
+            S_home, S_away = 0.0, 1.0
         else:
-            Sa, Sb = 0.5, 0.5
+            S_home, S_away = 0.5, 0.5
 
-        # Expected results
-        Ea = self.expected_result(Ra, Rb, is_home=True)
-        Eb = 1 - Ea
+        # Surprise factor
+        surprise = abs(S_home - exp_home)
 
-        # Elo updates
-        ratings[home] = Ra + self.k * (Sa - Ea)
-        ratings[away] = Rb + self.k * (Sb - Eb)
+        # Margin sensitivity
+        goal_diff = abs(FTHG - FTAG)
+        margin_mult = self.margin_multiplier(goal_diff)
+
+        # Effective K
+        K_eff = self.k * (1.0 + surprise) * margin_mult
+
+        # New ratings
+        ratings[home] = R_home + K_eff * (S_home - exp_home)
+        ratings[away] = R_away + K_eff * (S_away - exp_away)
 
         return ratings
+
+    # ------------------------------------------------------------------ #
+    # Fit Entire Dataset (optional)
+    # ------------------------------------------------------------------ #
+
+    def fit(self, df):
+        """Fit Elo on full historical dataset."""
+        teams = sorted(set(df["HomeTeam"]).union(df["AwayTeam"]))
+        self.ratings = {t: float(self.base_rating) for t in teams}
+
+        for _, row in df.iterrows():
+            home = row["HomeTeam"]
+            away = row["AwayTeam"]
+            FTHG = row["FTHG"]
+            FTAG = row["FTAG"]
+            self.ratings = self.update_ratings_match(self.ratings, home, away, FTHG, FTAG)
+
+        return self
+
+    # ------------------------------------------------------------------ #
+    # Probability Model (3-way)
+    # ------------------------------------------------------------------ #
+
+    def _dynamic_draw_prob(self, R_home: float, R_away: float) -> float:
+        """Increasing draw probability for evenly matched teams."""
+        diff = abs((R_home + self.home_adv) - R_away)
+        bump = self.draw_max_extra * np.exp(-(diff / self.draw_scale) ** 2)
+        pD = self.draw_base + bump
+        return float(max(0.0, min(0.5, pD)))
+
+    def _three_way_probs(self, R_home: float, R_away: float) -> dict:
+        """Compute final 3-way probabilities."""
+        # Two-outcome update
+        pH_two = self.expected_home_prob(R_home, R_away)
+        pA_two = 1.0 - pH_two
+
+        # Draw share
+        pD = self._dynamic_draw_prob(R_home, R_away)
+
+        # Remaining mass
+        remaining = max(1e-12, 1.0 - pD)
+        pH = remaining * pH_two
+        pA = remaining * pA_two
+
+        # Normalize
+        Z = pH + pD + pA
+        return {"H": pH / Z, "D": pD / Z, "A": pA / Z}
+
+    # ------------------------------------------------------------------ #
+    # COMPATIBILITY LAYER for BACKTEST
+    # ------------------------------------------------------------------ #
+
+    def update(self, home, away, FTHG, FTAG):
+        """
+        Backtest-compatible incremental update:
+        elo.update(home, away, fthg, ftag)
+        """
+        # Ensure teams exist
+        self._ensure_team(home)
+        self._ensure_team(away)
+
+        self.ratings = self.update_ratings_match(
+            self.ratings, home, away, FTHG, FTAG
+        )
+
+    def predict(self, home, away):
+        """
+        Backtest-compatible probability prediction:
+        elo.predict(home, away) -> (pH, pD, pA)
+        """
+        self._ensure_team(home)
+        self._ensure_team(away)
+
+        R_home = self.ratings[home]
+        R_away = self.ratings[away]
+
+        probs = self._three_way_probs(R_home, R_away)
+        return probs["H"], probs["D"], probs["A"]
