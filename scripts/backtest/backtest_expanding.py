@@ -18,7 +18,6 @@ OUT_DIR = ROOT / "models" / "history"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 OUT_PATH = OUT_DIR / "backtest_expanding_matchday.csv"
 
-# You can tweak these if you want
 BACKTEST_START_DATE = pd.Timestamp("2016-08-01")
 MIN_TRAIN_MATCHES = 200
 
@@ -41,38 +40,33 @@ def outcome_label(hg, ag):
 
 def backtest_expanding(config=None):
     start_global = time.time()
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Starting EXPANDING MATCHDAY backtest")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting EXPANDING MATCHDAY backtest")
 
     cfg = config or load_config()
     results_path = ROOT / cfg["data"]["results_csv"]
     if not results_path.exists():
         raise FileNotFoundError(f"Results CSV not found: {results_path}")
 
-    # Load results
     df = pd.read_csv(results_path, parse_dates=["Date"])
     df = df.sort_values("Date").reset_index(drop=True)
 
-    # Drop rows with missing scores
     before = len(df)
     df = df.dropna(subset=["FTHG", "FTAG"])
     dropped = before - len(df)
     if dropped:
-        print(f"⚠ Dropped {dropped} rows with missing FTHG/FTAG")
+        print(f"WARNING: Dropped {dropped} rows with missing FTHG/FTAG")
 
-    # Ensure Result column exists
     if "Result" not in df.columns:
         df["Result"] = df.apply(lambda r: outcome_label(r["FTHG"], r["FTAG"]), axis=1)
 
-    # Filter to backtest start
     df = df[df["Date"] >= BACKTEST_START_DATE].copy()
     if df.empty:
-        print("No matches on/after BACKTEST_START_DATE")
+        print("No matches found after BACKTEST_START_DATE")
         return
 
     unique_dates = sorted(df["Date"].unique())
     print(f"Total match dates (expanding): {len(unique_dates)}")
 
-    # Model config
     dc_cfg = cfg.get("model", {}).get("dc", {})
     elo_cfg = cfg.get("model", {}).get("elo", {})
 
@@ -80,18 +74,15 @@ def backtest_expanding(config=None):
 
     for i, date in enumerate(unique_dates):
         day_matches = df[df["Date"] == date]
-
-        # Training data: ALL matches before current date (expanding window)
         history = df[df["Date"] < date].dropna(subset=["FTHG", "FTAG"])
         if len(history) < MIN_TRAIN_MATCHES:
             continue
 
         print(
-            f"[{i+1}/{len(unique_dates)}] {date.date()} – "
-            f"training on {len(history)} matches, predicting {len(day_matches)} matches"
+            f"[{i+1}/{len(unique_dates)}] {date.date()} - "
+            f"training on {len(history)} matches, predicting {len(day_matches)}"
         )
 
-        # Fit Dixon–Coles
         dc = DixonColesModel(
             rho_init=dc_cfg.get("rho_init", 0.0),
             home_adv_init=dc_cfg.get("home_adv_init", 0.15),
@@ -100,7 +91,6 @@ def backtest_expanding(config=None):
         use_xg = "Home_xG" in history.columns and "Away_xG" in history.columns
         dc.fit(history, use_xg=use_xg)
 
-        # Fit Elo
         elo = EloModel(
             k_factor=elo_cfg.get("k_factor", 18.0),
             home_advantage=elo_cfg.get("home_advantage", 55.0),
@@ -111,7 +101,6 @@ def backtest_expanding(config=None):
         )
         elo.fit(history)
 
-        # Predict each match for this date
         for _, row in day_matches.iterrows():
             home = row["HomeTeam"]
             away = row["AwayTeam"]
@@ -153,16 +142,16 @@ def backtest_expanding(config=None):
             )
 
     if not rows:
-        print("⚠ Expanding backtest produced no rows.")
+        print("WARNING: Expanding backtest produced no rows.")
         return
 
-    eval_df = pd.DataFrame(rows).sort_values("Date")
-    eval_df.to_csv(OUT_PATH, index=False)
+    out_df = pd.DataFrame(rows).sort_values("Date")
+    out_df.to_csv(OUT_PATH, index=False)
 
-    total_elapsed = time.time() - start_global
-    print(f"\nSaved expanding matchday backtest → {OUT_PATH}")
-    print(f"⏱ Total runtime: {total_elapsed/60:.2f} minutes")
-    print(f"Total matches evaluated: {len(eval_df)}")
+    elapsed = time.time() - start_global
+    print(f"Saved expanding backtest -> {OUT_PATH}")
+    print(f"Total runtime: {elapsed/60:.2f} minutes")
+    print(f"Total matches evaluated: {len(out_df)}")
 
 
 if __name__ == "__main__":
