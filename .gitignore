@@ -1,0 +1,68 @@
+# ------------------------------------
+# 1. Dependency and Build Directories
+# ------------------------------------
+# Node.js dependencies
+/node_modules
+/npm-debug.log
+/yarn-error.log
+
+# Python virtual environment (venv)
+/venv
+/env
+__pycache__/
+
+# Compiled/Build/Output files
+/dist/
+/build/
+/out/
+*.o
+*.a
+*.pyc
+
+# ------------------------------------
+# 2. Operating System Files
+# ------------------------------------
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+
+# ------------------------------------
+# 3. Common IDE and Editor Files
+# ------------------------------------
+# Visual Studio Code
+.vscode/
+
+# JetBrains IDEs (IntelliJ, PyCharm, etc.)
+.idea/
+*.iml
+
+# Vim/Nano backup files
+*~
+
+# Emacs
+#*#
+
+# ------------------------------------
+# 4. Logs, Data, and Secrets (User Request)
+# ------------------------------------
+# Logs
+*.log
+log/
+tmp/
+
+# Databases and Data Files (as requested previously)
+*.csv
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment variables and secrets
+# IMPORTANT: Never commit files containing passwords, API keys, or sensitive info.
+.env
+.env.local
+config/secrets.yml
