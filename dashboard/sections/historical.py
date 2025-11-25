@@ -18,18 +18,13 @@ def section_historical_accuracy():
     if df.empty:
         st.info("No valid dated rows in comparison data.")
         return
+    # Only show rows with actual results (completed matches)
+    df = df[df["actual_winner"].notna()]
 
-    # Only keep rows that have model score OR ChatGPT score
-    score_series = df.get("score_pred", pd.Series([None] * len(df)))
-    chat_series = df.get("chatgpt_pred", pd.Series([None] * len(df)))
-
-    df = df[
-        (score_series.notna() & (score_series != "")) |
-        (chat_series.notna() & (chat_series != ""))
-    ]
     if df.empty:
-        st.info("No rows have model or ChatGPT scores.")
+        st.info("No completed matches found in DB for this season.")
         return
+
 
     # ------------------------------------------------------------------------------------
     # Convert winner codes (H/A/D) → actual team names

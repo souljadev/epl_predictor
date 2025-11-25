@@ -20,7 +20,9 @@ def section_upcoming_predictions():
 
     df_display = df.copy()
 
-    # Model winner from probs
+    # ----------------------------------------------------------
+    # Model winner from probabilities
+    # ----------------------------------------------------------
     def model_winner(row):
         probs = [row["home_win_prob"], row["draw_prob"], row["away_win_prob"]]
         if any(pd.isna(probs)):
@@ -35,7 +37,9 @@ def section_upcoming_predictions():
 
     df_display["Model Winner"] = df_display.apply(model_winner, axis=1)
 
+    # ----------------------------------------------------------
     # Model score
+    # ----------------------------------------------------------
     def model_score(row):
         if isinstance(row.get("score_pred"), str) and "-" in row["score_pred"]:
             return row["score_pred"]
@@ -47,7 +51,9 @@ def section_upcoming_predictions():
 
     df_display["Model Score"] = df_display.apply(model_score, axis=1)
 
+    # ----------------------------------------------------------
     # ChatGPT winner
+    # ----------------------------------------------------------
     def chatgpt_winner(score, home, away):
         if not isinstance(score, str) or "-" not in score:
             return ""
@@ -67,7 +73,9 @@ def section_upcoming_predictions():
         axis=1,
     )
 
-    # Winner match indicator
+    # ----------------------------------------------------------
+    # Winner Match?
+    # ----------------------------------------------------------
     def match_indicator(row):
         mw = row["Model Winner"]
         cw = row["ChatGPT Winner"]
@@ -82,7 +90,26 @@ def section_upcoming_predictions():
 
     df_display["Winner Match?"] = df_display.apply(match_indicator, axis=1)
 
-    # Agreement stats
+    # ----------------------------------------------------------
+    # Score Match? (Exact Score)
+    # ----------------------------------------------------------
+    def score_match_indicator(row):
+        m = row.get("Model Score", "")
+        c = row.get("chatgpt_pred", "")
+
+        if not isinstance(c, str) or "-" not in c:
+            return "⚪ No ChatGPT Score"
+        if m == "":
+            return "⚪ No Model Score"
+        if m == c:
+            return "🟩 Exact Match"
+        return "🟥 No Match"
+
+    df_display["Score Match?"] = df_display.apply(score_match_indicator, axis=1)
+
+    # ----------------------------------------------------------
+    # Agreement stats (winner)
+    # ----------------------------------------------------------
     counts = df_display["Winner Match?"].value_counts(dropna=False)
     total_with_data = len(df_display[df_display["Winner Match?"] != "⚪ No ChatGPT"]) or 1
 
@@ -109,7 +136,9 @@ def section_upcoming_predictions():
     )
     col_stats[3].metric("No ChatGPT Data", f"{no_data}")
 
-    # Table formatting
+    # ----------------------------------------------------------
+    # Rename columns for UI
+    # ----------------------------------------------------------
     df_display.rename(
         columns={
             "date": "Date",
@@ -122,11 +151,15 @@ def section_upcoming_predictions():
         },
         inplace=True,
     )
+
     df_display["Date"] = df_display["Date"].astype(str)
 
     for col in ["Prob Home Win", "Prob Draw", "Prob Away Win"]:
         df_display[col] = (df_display[col] * 100).round().astype(int).astype(str) + "%"
 
+    # ----------------------------------------------------------
+    # Desired column order
+    # ----------------------------------------------------------
     cols_order = [
         "Date",
         "Home",
@@ -139,10 +172,15 @@ def section_upcoming_predictions():
         "ChatGPT Score",
         "ChatGPT Winner",
         "Winner Match?",
+        "Score Match?",
     ]
+
     cols_order = [c for c in cols_order if c in df_display.columns]
     df_display = df_display[cols_order]
 
+    # ----------------------------------------------------------
+    # Styling for match indicators
+    # ----------------------------------------------------------
     def style_match(val):
         if isinstance(val, str):
             if "🟩" in val:
@@ -155,7 +193,11 @@ def section_upcoming_predictions():
                 return "color: grey;"
         return ""
 
-    styled_df = df_display.style.applymap(style_match, subset=["Winner Match?"])
+    styled_df = (
+        df_display.style
+        .applymap(style_match, subset=["Winner Match?"])
+        .applymap(style_match, subset=["Score Match?"])
+    )
 
     st.subheader("Predictions for Next 7 Days")
     st.dataframe(styled_df, use_container_width=True)
