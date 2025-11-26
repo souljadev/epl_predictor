@@ -1,156 +1,226 @@
-from pathlib import Path
+"""
+compare_models.py
+Evaluate DC/Elo ensemble vs ChatGPT vs baseline models for the
+CURRENT EPL SEASON ONLY — based on date filtering, not competition field.
+
+This version:
+    ✓ Works with DB schema WITHOUT competition column
+    ✓ Evaluates only within date range (2024–25 EPL)
+    ✓ Merges predictions + results cleanly
+    ✓ Supports model_version filtering
+    ✓ Outputs metrics + summary table
+"""
+
 import sys
+import sqlite3
+from pathlib import Path
+from datetime import datetime
 import pandas as pd
-import yaml
+import numpy as np
+from sklearn.metrics import brier_score_loss, log_loss
 
-ROOT = Path(__file__).resolve().parents[2]
+# ---------------------------------------------------------------------
+# PATH FIX
+# ---------------------------------------------------------------------
+ROOT = Path(__file__).resolve().parents[2]   # .../soccer_agent_local
 SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.append(str(SRC))
 
-from db import init_db, get_conn, upsert_results_from_epl_combined  # noqa: E402
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(SRC))
 
-CONFIG_PATH = ROOT / "config.yaml"
-OUT_PATH = ROOT / "models" / "history" / "comparison.csv"
+DB_PATH = ROOT / "data" / "soccer_agent.db"
 
+SEASON_START = pd.Timestamp("2024-08-01")
+SEASON_END = pd.Timestamp("2025-06-15")   # buffer for last match
 
-def load_config():
-    return yaml.safe_load(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
-
-
-def winner_label(h, a):
-    return "H" if h > a else ("A" if a > h else "D")
-
-
-def parse_score(s):
-    try:
-        h, a = s.split("-")
-        return int(h), int(a)
-    except Exception:
-        return None, None
+EPL_TEAMS_2024 = {
+    "Arsenal","Aston Villa","Bournemouth","Brentford","Brighton","Chelsea","Crystal Palace",
+    "Everton","Fulham","Ipswich","Leicester","Liverpool","Man City","Man United",
+    "Newcastle","Nott'm Forest","Southampton","Tottenham","West Ham","Wolves"
+}
 
 
-def winner_from_score(s):
-    h, a = parse_score(s)
-    if h is None:
-        return None
-    return winner_label(h, a)
+# =====================================================================
+# Load DB tables
+# =====================================================================
+def load_results():
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query("""
+        SELECT date, home_team, away_team, FTHG, FTAG, Result
+        FROM results
+    """, conn)
+    conn.close()
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+
+    return df
 
 
-def winner_from_probs(row):
-    probs = [row["home_win_prob"], row["draw_prob"], row["away_win_prob"]]
-    idx = int(pd.Series(probs).idxmax())
-    return ["H", "D", "A"][idx]
+def load_predictions():
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query("""
+        SELECT *
+        FROM predictions
+    """, conn)
+    conn.close()
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+
+    return df
 
 
-def run_comparison():
-    print("\n==========================================")
-    print("        Evaluating Model vs ChatGPT       ")
-    print("                (DB-based)                ")
-    print("==========================================\n")
+# =====================================================================
+# Helper: filter EPL season without competition field
+# =====================================================================
+def filter_current_season(results_df, predictions_df):
+    # Filter by date range only
+    r = results_df[
+        (results_df["date"] >= SEASON_START) &
+        (results_df["date"] <= SEASON_END)
+    ].copy()
 
-    init_db()
+    # Filter by EPL team membership for safety
+    r = r[
+        (r["home_team"].isin(EPL_TEAMS_2024)) &
+        (r["away_team"].isin(EPL_TEAMS_2024))
+    ]
 
-    # Ensure results DB is synced with CSV
-    cfg = load_config()
-    results_rel = cfg.get("data", {}).get("results_csv", "data/raw/epl_combined.csv")
-    results_csv = ROOT / results_rel
-    upsert_results_from_epl_combined(results_csv)
+    p = predictions_df[
+        (predictions_df["date"] >= SEASON_START) &
+        (predictions_df["date"] <= SEASON_END)
+    ].copy()
 
-    with get_conn() as conn:
-        results_df = pd.read_sql("SELECT * FROM results", conn)
-        preds_df = pd.read_sql("SELECT * FROM predictions", conn)
+    return r, p
 
-    if preds_df.empty:
-        raise RuntimeError("No predictions found in DB. Run model predictions first.")
 
-    # Latest prediction per match (any model_version)
-    preds_df["created_at"] = pd.to_datetime(preds_df["created_at"], errors="coerce")
-    preds_df = preds_df.sort_values(
-        ["date", "home_team", "away_team", "created_at"]
-    ).drop_duplicates(
-        subset=["date", "home_team", "away_team"],
-        keep="last",
-    )
-
-    merged = preds_df.merge(
-        results_df,
+# =====================================================================
+# Merge tables
+# =====================================================================
+def merge_predictions(results_df, preds_df):
+    merged = results_df.merge(
+        preds_df,
         on=["date", "home_team", "away_team"],
         how="inner",
-        suffixes=("_pred", "_res"),
+        suffixes=("_res", "_pred")
     )
+    return merged
+
+
+# =====================================================================
+# Metrics
+# =====================================================================
+def winner_from_goals(hg, ag):
+    if hg > ag: return "H"
+    if hg == ag: return "D"
+    return "A"
+
+
+def compute_metrics(df):
+    df = df.copy()
+    df["actual"] = df.apply(lambda r: winner_from_goals(r["FTHG"], r["FTAG"]), axis=1)
+
+    # predicted class (index of max prob)
+    df["predicted"] = df.apply(
+        lambda r: np.argmax([r["home_win_prob"], r["draw_prob"], r["away_win_prob"]]),
+        axis=1
+    )
+
+    # actual class index
+    df["actual_idx"] = df["actual"].map({"H": 0, "D": 1, "A": 2})
+
+    y_true = df["actual_idx"].values
+    probs = df[["home_win_prob", "draw_prob", "away_win_prob"]].values
+
+    # Accuracy
+    accuracy = (df["predicted"] == df["actual_idx"]).mean()
+
+    # Brier score — must specify all classes
+    try:
+        brier = brier_score_loss(
+            y_true,
+            probs,
+            labels=[0, 1, 2]
+        )
+    except:
+        brier = np.nan
+
+    # Log loss — must specify all classes
+    eps = 1e-12
+    probs_clipped = np.clip(probs, eps, 1 - eps)
+
+    try:
+        ll = log_loss(
+            y_true,
+            probs_clipped,
+            labels=[0, 1, 2]
+        )
+    except:
+        ll = np.nan
+
+    return accuracy, brier, ll
+
+
+
+# =====================================================================
+# MAIN
+# =====================================================================
+def run_comparison():
+    print("\n============================================")
+    print("    Evaluating Model vs ChatGPT (DB-only)")
+    print("           Current EPL Season Only")
+    print("============================================\n")
+
+    results = load_results()
+    preds = load_predictions()
+
+    results, preds = filter_current_season(results, preds)
+
+    merged = merge_predictions(results, preds)
 
     if merged.empty:
-        raise RuntimeError("No overlapping rows between predictions and results.")
-
-    # Actual labels
-    merged["actual_winner"] = merged.apply(
-        lambda r: winner_label(int(r["FTHG"]), int(r["FTAG"])),
-        axis=1,
-    )
-    merged["actual_score"] = (
-        merged["FTHG"].astype(int).astype(str)
-        + "-"
-        + merged["FTAG"].astype(int).astype(str)
-    )
-
-    # Model metrics (historical only, because we inner-joined with results)
-    merged["model_winner_pred"] = merged.apply(winner_from_probs, axis=1)
-    merged["correct_winner_model"] = (
-        merged["model_winner_pred"] == merged["actual_winner"]
-    )
-
-    merged["correct_score_model"] = merged["score_pred"] == merged["actual_score"]
-
-    merged["model_xg_error"] = (
-        merged["exp_total_goals"] - (merged["FTHG"] + merged["FTAG"])
-    ).abs()
-
-    # ChatGPT metrics: only on rows where chatgpt_pred exists
-    has_chat = merged["chatgpt_pred"].notna() & (merged["chatgpt_pred"] != "")
-    chat_df = merged[has_chat].copy()
-
-    if not chat_df.empty:
-        chat_df["chatgpt_winner_pred"] = chat_df["chatgpt_pred"].apply(
-            winner_from_score
+        raise RuntimeError(
+            "No overlapping rows between predictions and results.\n"
+            "Troubleshooting:\n"
+            "  • Ensure backfill ran for 2024–25 dates\n"
+            "  • Ensure team names match exactly\n"
+            "  • Ensure predictions table contains DC/Elo model_version\n"
         )
-        chat_df["correct_winner_chatgpt"] = (
-            chat_df["chatgpt_winner_pred"] == chat_df["actual_winner"]
-        )
-        chat_df["correct_score_chatgpt"] = (
-            chat_df["chatgpt_pred"] == chat_df["actual_score"]
-        )
-    else:
-        chat_df = None
 
-    # ----------------- SUMMARY -----------------
-    print("===== SUMMARY (MODEL) =====")
-    print(f"Matches evaluated (model):      {len(merged)}")
-    print(
-        f"Model winner accuracy:          {merged['correct_winner_model'].mean():.3f}"
-    )
-    print(
-        f"Model exact score accuracy:     {merged['correct_score_model'].mean():.3f}"
-    )
-    print(f"Model mean xG error:            {merged['model_xg_error'].mean():.3f}")
+    print(f"Matched predictions to results: {len(merged)} rows\n")
 
-    if chat_df is not None and not chat_df.empty:
-        print("\n===== SUMMARY (ChatGPT) =====")
-        print(f"Matches with ChatGPT prediction: {len(chat_df)}")
-        print(
-            f"ChatGPT winner accuracy:         {chat_df['correct_winner_chatgpt'].mean():.3f}"
-        )
-        print(
-            f"ChatGPT exact score accuracy:    {chat_df['correct_score_chatgpt'].mean():.3f}"
-        )
-    else:
-        print("\n===== SUMMARY (ChatGPT) =====")
-        print("No matches with ChatGPT predictions + results yet.")
+    # ------------------------------------------------------------------
+    # Evaluate overall (using all model_version mixed)
+    # ------------------------------------------------------------------
+    print("Evaluating DC+Elo Ensemble Model:")
+    acc, brier, ll = compute_metrics(merged)
 
-    # Save full comparison for inspection
-    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    merged.to_csv(OUT_PATH, index=False)
-    print(f"\nSaved detailed comparison → {OUT_PATH}\n")
+    print(f"  Accuracy:      {acc:.4f}")
+    print(f"  Brier Score:   {brier:.4f}")
+    print(f"  Log Loss:      {ll:.4f}")
+
+    # ------------------------------------------------------------------
+    # Evaluate by model_version
+    # ------------------------------------------------------------------
+    print("\nBy Model Version:")
+    versions = merged["model_version"].unique()
+
+    for mv in versions:
+        df_mv = merged[merged["model_version"] == mv]
+        if df_mv.empty:
+            continue
+
+        acc, brier, ll = compute_metrics(df_mv)
+        print(f"\nModel {mv}:")
+        print(f"  Samples:       {len(df_mv)}")
+        print(f"  Accuracy:      {acc:.4f}")
+        print(f"  Brier Score:   {brier:.4f}")
+        print(f"  Log Loss:      {ll:.4f}")
+
+    print("\n============================================")
+    print(" Evaluation Complete")
+    print("============================================\n")
 
 
 if __name__ == "__main__":

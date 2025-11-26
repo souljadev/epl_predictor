@@ -1,39 +1,45 @@
+import sys
+from pathlib import Path
 import streamlit as st
 
-from sections.predictions import section_upcoming_predictions
-from sections.historical import section_historical_accuracy
-from sections.chatgpt_vs_model import section_chatgpt_vs_model
-from sections.backtests import section_backtests
+# ------------------------------------------------------------
+# Path setup
+# ------------------------------------------------------------
+ROOT = Path(__file__).resolve().parents[1]  # .../soccer_agent_local
+SRC = ROOT / "src"
+DB_PATH = ROOT / "data" / "soccer_agent.db"
 
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
-st.set_page_config(
-    layout="wide",
-    page_title="EPL Agent Dashboard",
-    page_icon="⚽",
-)
+from sections import predictions, comparison, historical  # type: ignore
 
 
 def main():
-    st.sidebar.title("⚽ EPL Agent Dashboard")
-
-    page = st.sidebar.radio(
-        "View",
-        (
-            "Upcoming Predictions",
-            "Historical Accuracy",
-            "ChatGPT vs Model",
-            "Backtests",
-        ),
+    st.set_page_config(
+        page_title="EPL Agent Dashboard",
+        layout="wide",
     )
 
-    if page == "Upcoming Predictions":
-        section_upcoming_predictions()
-    elif page == "Historical Accuracy":
-        section_historical_accuracy()
-    elif page == "ChatGPT vs Model":
-        section_chatgpt_vs_model()
-    else:
-        section_backtests()
+    st.title("⚽ EPL Agent — Model Dashboard")
+
+    st.sidebar.header("Navigation")
+    page = st.sidebar.radio(
+        "Go to",
+        options=["Predictions", "Comparison", "Historical"],
+    )
+
+    st.sidebar.markdown("---")
+    st.sidebar.write(f"DB: `{DB_PATH.name}`")
+
+    if page == "Predictions":
+        predictions.render(DB_PATH)
+    elif page == "Comparison":
+        comparison.render(DB_PATH)
+    elif page == "Historical":
+        historical.render(DB_PATH)
 
 
 if __name__ == "__main__":

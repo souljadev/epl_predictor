@@ -1,203 +1,109 @@
+import sqlite3
+from pathlib import Path
+from datetime import date
 import pandas as pd
 import streamlit as st
 
-from utils.loaders import load_upcoming_predictions
 
+def load_predictions_for_date(db_path: Path, target_date: pd.Timestamp) -> pd.DataFrame:
+    conn = sqlite3.connect(db_path)
+    df = pd.read_sql_query(
+        """
+        SELECT
+            date,
+            home_team,
+            away_team,
+            model_version,
+            home_win_prob,
+            draw_prob,
+            away_win_prob,
+            exp_goals_home,
+            exp_goals_away,
+            exp_total_goals,
+            score_pred,
+            chatgpt_pred
+        FROM predictions
+        WHERE date = ?
+        ORDER BY date, home_team, away_team
+        """,
+        conn,
+        params=(target_date.strftime("%Y-%m-%d"),),
+    )
+    conn.close()
 
-def section_upcoming_predictions():
-    st.header("🔮 Upcoming Fixtures – Model & ChatGPT Predictions")
-
-    df = load_upcoming_predictions(days_ahead=7)
     if df.empty:
-        st.info(
-            "No upcoming fixtures with predictions found.\n\n"
-            "Make sure:\n"
-            " - Fixtures exist in the DB (future dates)\n"
-            " - Model predictions have been run and written to DB\n"
-            " - ChatGPT predictions (chatgpt_pred) have been generated"
-        )
+        return df
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    return df
+
+
+def render(db_path: Path):
+    st.subheader("Match Predictions")
+
+    today = date.today()
+    selected_date = st.date_input(
+        "Select match date",
+        value=today,
+    )
+
+    target_ts = pd.to_datetime(selected_date)
+
+    df = load_predictions_for_date(db_path, target_ts)
+
+    if df.empty:
+        st.info("No predictions found for this date. Generate predictions first.")
         return
 
-    df_display = df.copy()
+    st.markdown(f"### Predictions for {target_ts.date()}")
 
-    # ----------------------------------------------------------
-    # Model winner from probabilities
-    # ----------------------------------------------------------
-    def model_winner(row):
-        probs = [row["home_win_prob"], row["draw_prob"], row["away_win_prob"]]
-        if any(pd.isna(probs)):
-            return ""
-        idx = int(pd.Series(probs).idxmax())
-        if idx == 0:
-            return row["home_team"]
-        elif idx == 1:
-            return "Draw"
-        else:
-            return row["away_team"]
+    # Nicely formatted table
+    display_df = df.copy()
+    display_df["H Prob"] = (display_df["home_win_prob"] * 100).round(1)
+    display_df["D Prob"] = (display_df["draw_prob"] * 100).round(1)
+    display_df["A Prob"] = (display_df["away_win_prob"] * 100).round(1)
 
-    df_display["Model Winner"] = df_display.apply(model_winner, axis=1)
-
-    # ----------------------------------------------------------
-    # Model score
-    # ----------------------------------------------------------
-    def model_score(row):
-        if isinstance(row.get("score_pred"), str) and "-" in row["score_pred"]:
-            return row["score_pred"]
-        if pd.isna(row["exp_goals_home"]) or pd.isna(row["exp_goals_away"]):
-            return ""
-        h = int(round(row["exp_goals_home"]))
-        a = int(round(row["exp_goals_away"]))
-        return f"{h}-{a}"
-
-    df_display["Model Score"] = df_display.apply(model_score, axis=1)
-
-    # ----------------------------------------------------------
-    # ChatGPT winner
-    # ----------------------------------------------------------
-    def chatgpt_winner(score, home, away):
-        if not isinstance(score, str) or "-" not in score:
-            return ""
-        try:
-            h_str, a_str = score.split("-")
-            h, a = int(h_str), int(a_str)
-        except Exception:
-            return ""
-        if h > a:
-            return home
-        if a > h:
-            return away
-        return "Draw"
-
-    df_display["ChatGPT Winner"] = df_display.apply(
-        lambda r: chatgpt_winner(r.get("chatgpt_pred", ""), r["home_team"], r["away_team"]),
-        axis=1,
-    )
-
-    # ----------------------------------------------------------
-    # Winner Match?
-    # ----------------------------------------------------------
-    def match_indicator(row):
-        mw = row["Model Winner"]
-        cw = row["ChatGPT Winner"]
-
-        if cw == "":
-            return "⚪ No ChatGPT"
-        if mw == cw:
-            return "🟩 Match"
-        if mw == "Draw" or cw == "Draw":
-            return "🟨 Partial"
-        return "🟥 No Match"
-
-    df_display["Winner Match?"] = df_display.apply(match_indicator, axis=1)
-
-    # ----------------------------------------------------------
-    # Score Match? (Exact Score)
-    # ----------------------------------------------------------
-    def score_match_indicator(row):
-        m = row.get("Model Score", "")
-        c = row.get("chatgpt_pred", "")
-
-        if not isinstance(c, str) or "-" not in c:
-            return "⚪ No ChatGPT Score"
-        if m == "":
-            return "⚪ No Model Score"
-        if m == c:
-            return "🟩 Exact Match"
-        return "🟥 No Match"
-
-    df_display["Score Match?"] = df_display.apply(score_match_indicator, axis=1)
-
-    # ----------------------------------------------------------
-    # Agreement stats (winner)
-    # ----------------------------------------------------------
-    counts = df_display["Winner Match?"].value_counts(dropna=False)
-    total_with_data = len(df_display[df_display["Winner Match?"] != "⚪ No ChatGPT"]) or 1
-
-    full_match = counts.get("🟩 Match", 0)
-    partial = counts.get("🟨 Partial", 0)
-    no_match = counts.get("🟥 No Match", 0)
-    no_data = counts.get("⚪ No ChatGPT", 0)
-
-    col_stats = st.columns(4)
-    col_stats[0].metric(
-        "Full Match (same winner)",
-        f"{full_match} / {total_with_data}",
-        f"{full_match / total_with_data:.0%}",
-    )
-    col_stats[1].metric(
-        "Partial (Draw vs Win)",
-        f"{partial} / {total_with_data}",
-        f"{partial / total_with_data:.0%}",
-    )
-    col_stats[2].metric(
-        "No Match",
-        f"{no_match} / {total_with_data}",
-        f"{no_match / total_with_data:.0%}",
-    )
-    col_stats[3].metric("No ChatGPT Data", f"{no_data}")
-
-    # ----------------------------------------------------------
-    # Rename columns for UI
-    # ----------------------------------------------------------
-    df_display.rename(
-        columns={
-            "date": "Date",
-            "home_team": "Home",
-            "away_team": "Away",
-            "home_win_prob": "Prob Home Win",
-            "draw_prob": "Prob Draw",
-            "away_win_prob": "Prob Away Win",
-            "chatgpt_pred": "ChatGPT Score",
-        },
-        inplace=True,
-    )
-
-    df_display["Date"] = df_display["Date"].astype(str)
-
-    for col in ["Prob Home Win", "Prob Draw", "Prob Away Win"]:
-        df_display[col] = (df_display[col] * 100).round().astype(int).astype(str) + "%"
-
-    # ----------------------------------------------------------
-    # Desired column order
-    # ----------------------------------------------------------
-    cols_order = [
-        "Date",
-        "Home",
-        "Away",
-        "Prob Home Win",
-        "Prob Draw",
-        "Prob Away Win",
-        "Model Winner",
-        "Model Score",
-        "ChatGPT Score",
-        "ChatGPT Winner",
-        "Winner Match?",
-        "Score Match?",
+    display_df = display_df[
+        [
+            "date",
+            "home_team",
+            "away_team",
+            "model_version",
+            "H Prob",
+            "D Prob",
+            "A Prob",
+            "exp_goals_home",
+            "exp_goals_away",
+            "exp_total_goals",
+            "score_pred",
+            "chatgpt_pred",
+        ]
     ]
 
-    cols_order = [c for c in cols_order if c in df_display.columns]
-    df_display = df_display[cols_order]
+    st.dataframe(display_df, use_container_width=True)
 
-    # ----------------------------------------------------------
-    # Styling for match indicators
-    # ----------------------------------------------------------
-    def style_match(val):
-        if isinstance(val, str):
-            if "🟩" in val:
-                return "color: green; font-weight: bold;"
-            if "🟥" in val:
-                return "color: red; font-weight: bold;"
-            if "🟨" in val:
-                return "color: goldenrod; font-weight: bold;"
-            if "⚪" in val:
-                return "color: grey;"
-        return ""
-
-    styled_df = (
-        df_display.style
-        .applymap(style_match, subset=["Winner Match?"])
-        .applymap(style_match, subset=["Score Match?"])
-    )
-
-    st.subheader("Predictions for Next 7 Days")
-    st.dataframe(styled_df, use_container_width=True)
+    st.markdown("#### Per-match details")
+    for _, row in df.iterrows():
+        with st.expander(
+            f"{row['home_team']} vs {row['away_team']} — "
+            f"{(row['home_win_prob']*100):.1f}% / "
+            f"{(row['draw_prob']*100):.1f}% / "
+            f"{(row['away_win_prob']*100):.1f}%"
+        ):
+            st.write(f"**Model version:** `{row['model_version']}`")
+            st.write(
+                f"**Probabilities** – Home: `{row['home_win_prob']:.3f}`, "
+                f"Draw: `{row['draw_prob']:.3f}`, "
+                f"Away: `{row['away_win_prob']:.3f}`"
+            )
+            st.write(
+                f"**Expected goals** – Home: `{row['exp_goals_home']:.2f}`, "
+                f"Away: `{row['exp_goals_away']:.2f}`, "
+                f"Total: `{row['exp_total_goals']:.2f}`"
+            )
+            st.write(f"**Most likely scoreline (sampled):** `{row['score_pred']}`")
+            if row["chatgpt_pred"]:
+                st.write("**ChatGPT prediction:**")
+                st.write(row["chatgpt_pred"])
+            else:
+                st.write("_No ChatGPT overlay stored for this match._")

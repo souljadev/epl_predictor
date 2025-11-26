@@ -1,235 +1,236 @@
-from pathlib import Path
-from datetime import datetime
+"""
+Backfill DC+Elo ensemble predictions for an entire season
+into the unified DB.predictions table, using DB-only data.
 
-import pandas as pd
-import sqlite3
-import yaml
+Option C:
+- Reuse the same internals as src/predict/predict_model.py
+- Train only on matches *before* each matchday
+- Predict for that matchday's fixtures
+- Insert rows into predictions table for later evaluation
+"""
+
 import sys
+import sqlite3
+from pathlib import Path
+from datetime import date
+import numpy as np
+import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[1]  # .../soccer_agent_local
+# =====================================================================
+# ABSOLUTE PATH FIX (guaranteed to work on Windows)
+# =====================================================================
+SCRIPT_DIR = Path(__file__).resolve().parent          # .../soccer_agent_local/scripts
+ROOT = SCRIPT_DIR.parent                              # .../soccer_agent_local
 SRC = ROOT / "src"
-if str(SRC) not in sys.argv:
-    sys.path.insert(0, str(SRC))
 
-from predictor import train_models, predict_fixtures  # noqa: E402
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(SRC))
+
+# =====================================================================
+# Imports from your internal codebase
+# =====================================================================
+from src.predict.predict_model import load_config, sample_score_from_xg
+from predictor import train_models, predict_fixtures
+from db import init_db, insert_predictions
+
 
 DB_PATH = ROOT / "data" / "soccer_agent.db"
-CONFIG_PATH = ROOT / "config.yaml"
 
 
-def load_config() -> dict:
-    if CONFIG_PATH.exists():
-        return yaml.safe_load(CONFIG_PATH.read_text())
-    return {}
+# =====================================================================
+# Argument Parsing
+# =====================================================================
+def parse_args():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Backfill DC+Elo ensemble predictions into DB.predictions "
+            "for an entire season, using DB-only data."
+        )
+    )
+    parser.add_argument(
+        "--season-start",
+        type=str,
+        default="2024-08-01",
+        help="Start date (YYYY-MM-DD) for backfill window.",
+    )
+    parser.add_argument(
+        "--season-end",
+        type=str,
+        default=None,
+        help="Optional end date (YYYY-MM-DD). If omitted, uses today.",
+    )
+    parser.add_argument(
+        "--min-matches",
+        type=int,
+        default=60,
+        help="Minimum number of historical matches required before predicting.",
+    )
+
+    return parser.parse_args()
 
 
-def get_current_season_bounds():
+# =====================================================================
+# DB Helpers
+# =====================================================================
+def load_results_up_to(cutoff_date: pd.Timestamp) -> pd.DataFrame:
     """
-    Define season as July 1 -> June 30 that contains 'today'.
-    e.g. if today is 2025-11-24, season = 2025-07-01 .. 2026-06-30
-    """
-    today = pd.Timestamp.today().normalize()
-    season_year = today.year if today.month >= 7 else today.year - 1
-    season_start = pd.Timestamp(season_year, 7, 1)
-    season_end = pd.Timestamp(season_year + 1, 6, 30)
-    return season_start, season_end
+    Load historical results *before cutoff_date* from DB.results.
 
-
-def load_results_from_db():
-    """
-    Load ALL results currently in the DB.
-    This defines which matches we will backfill predictions for.
+    Returns DataFrame with: [Date, HomeTeam, AwayTeam, FTHG, FTAG]
     """
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query(
-        "SELECT date, home_team, away_team, FTHG, FTAG FROM results",
+        """
+        SELECT date, home_team, away_team, FTHG, FTAG
+        FROM results
+        WHERE date < ?
+        """,
         conn,
+        params=(cutoff_date.strftime("%Y-%m-%d"),),
     )
     conn.close()
 
     if df.empty:
-        return df
+        return pd.DataFrame(columns=["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"])
 
-    df["Date"] = pd.to_datetime(df["date"])
-    df.drop(columns=["date"], inplace=True)
-    return df
-
-
-def insert_backfill_predictions(preds_df: pd.DataFrame, model_version: str):
-    """
-    Insert predictions into unified predictions table.
-
-    preds_df must contain:
-      Date, HomeTeam, AwayTeam, pH, pD, pA, ExpHomeGoals, ExpAwayGoals, ExpTotalGoals
-    """
-    if preds_df.empty:
-        return
-
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-
-    now_str = datetime.utcnow().isoformat(timespec="seconds")
-
-    rows = []
-    for _, row in preds_df.iterrows():
-        date_str = pd.to_datetime(row["Date"]).strftime("%Y-%m-%d")
-        home = str(row["HomeTeam"])
-        away = str(row["AwayTeam"])
-
-        pH = float(row["pH"])
-        pD = float(row["pD"])
-        pA = float(row["pA"])
-        lamH = float(row["ExpHomeGoals"])
-        lamA = float(row["ExpAwayGoals"])
-        lamT = float(row.get("ExpTotalGoals", lamH + lamA))
-
-        # Simple score prediction via rounded xG
-        score_pred = f"{int(round(lamH))}-{int(round(lamA))}"
-
-        rows.append(
-            (
-                date_str,
-                home,
-                away,
-                model_version,
-                None,  # dixon_coles_probs
-                None,  # elo_probs
-                None,  # ensemble_probs
-                pH,
-                pD,
-                pA,
-                lamH,
-                lamA,
-                lamT,
-                score_pred,
-                None,  # chatgpt_pred (leave existing one untouched if present)
-                now_str,
-            )
-        )
-
-    cur.executemany(
-        """
-        INSERT INTO predictions (
-            date,
-            home_team,
-            away_team,
-            model_version,
-            dixon_coles_probs,
-            elo_probs,
-            ensemble_probs,
-            home_win_prob,
-            draw_prob,
-            away_win_prob,
-            exp_goals_home,
-            exp_goals_away,
-            exp_total_goals,
-            score_pred,
-            chatgpt_pred,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(date, home_team, away_team, model_version)
-        DO UPDATE SET
-            dixon_coles_probs=excluded.dixon_coles_probs,
-            elo_probs=excluded.elo_probs,
-            ensemble_probs=excluded.ensemble_probs,
-            home_win_prob=excluded.home_win_prob,
-            draw_prob=excluded.draw_prob,
-            away_win_prob=excluded.away_win_prob,
-            exp_goals_home=excluded.exp_goals_home,
-            exp_goals_away=excluded.exp_goals_away,
-            exp_total_goals=excluded.exp_total_goals,
-            score_pred=excluded.score_pred,
-            -- preserve existing ChatGPT score if we already have one
-            chatgpt_pred=COALESCE(predictions.chatgpt_pred, excluded.chatgpt_pred),
-            created_at=excluded.created_at;
-        """,
-        rows,
+    df["Date"] = pd.to_datetime(df["date"], errors="coerce")
+    df.rename(
+        columns={
+            "home_team": "HomeTeam",
+            "away_team": "AwayTeam",
+        },
+        inplace=True,
     )
 
-    conn.commit()
+    df = df.dropna(subset=["Date", "FTHG", "FTAG"])
+    return df[["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"]]
+
+
+def load_matchday_fixtures(match_date: pd.Timestamp) -> pd.DataFrame:
+    """
+    Treat DB.results as canonical fixtures list for that matchday.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        """
+        SELECT date, home_team, away_team
+        FROM results
+        WHERE date = ?
+        ORDER BY home_team, away_team
+        """,
+        conn,
+        params=(match_date.strftime("%Y-%m-%d"),),
+    )
     conn.close()
 
+    if df.empty:
+        return pd.DataFrame(columns=["Date", "HomeTeam", "AwayTeam"])
 
-def main():
-    print("\n==============================================")
-    print("  Backfill model score predictions – THIS SEASON")
-    print("==============================================\n")
+    df["Date"] = pd.to_datetime(df["date"], errors="coerce")
+    df.rename(
+        columns={
+            "home_team": "HomeTeam",
+            "away_team": "AwayTeam",
+        },
+        inplace=True,
+    )
+
+    return df[["Date", "HomeTeam", "AwayTeam"]]
+
+
+def get_matchdays_in_window(season_start: str, season_end: str | None) -> list[pd.Timestamp]:
+    """
+    Return sorted matchdays from DB.results in [season_start, season_end].
+    """
+    start_ts = pd.to_datetime(season_start)
+    end_ts = pd.to_datetime(season_end) if season_end else pd.Timestamp(date.today())
+
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        """
+        SELECT DISTINCT date
+        FROM results
+        WHERE date >= ?
+          AND date <= ?
+        ORDER BY date
+        """,
+        conn,
+        params=(
+            start_ts.strftime("%Y-%m-%d"),
+            end_ts.strftime("%Y-%m-%d"),
+        ),
+    )
+    conn.close()
+
+    if df.empty:
+        return []
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    return sorted(df["date"].unique())
+
+
+# =====================================================================
+# Core Backfill Loop
+# =====================================================================
+def backfill_model_predictions_for_season(
+    season_start: str,
+    season_end: str | None,
+    min_matches: int,
+):
 
     cfg = load_config()
-    data_cfg = cfg.get("data", {})
-    results_csv = ROOT / "data" / "raw" / "fbref_epl_xg.csv"
-    if not results_csv.exists():
-        raise FileNotFoundError(f"Results CSV not found: {results_csv}")
-
-    # Load full historical results from CSV for training (Dixon–Coles + Elo)
-    results_hist = pd.read_csv(results_csv, parse_dates=["Date"])
-    results_hist = results_hist.dropna(subset=["FTHG", "FTAG"])
-
-    # Load played matches from DB (this defines what we backfill)
-    results_db = load_results_from_db()
-    if results_db.empty:
-        print("No results found in DB – nothing to backfill.")
-        return
-
-    season_start, season_end = get_current_season_bounds()
-    today = pd.Timestamp.today().normalize()
-
-    # Filter DB results to current season and already-played matches
-    end_bound = min(season_end, today)
-    mask = (results_db["Date"] >= season_start) & (results_db["Date"] <= end_bound)
-    season_df = results_db[mask].copy()
-
-    if season_df.empty:
-        print("No matches in current season found in DB – nothing to backfill.")
-        return
-
-    print(f"Season window: {season_start.date()} → {end_bound.date()}")
-    print(f"Matches in DB for this season: {len(season_df)}")
-
-    # Unique matchdays (dates with one or more matches)
-    matchdays = sorted(season_df["Date"].unique())
-    print(f"Unique matchdays to backfill: {len(matchdays)}")
-
-    model_version = "dc_elo_ensemble_backfill"
-
-    total_inserted = 0
-
-    # Model config
-    dc_cfg = cfg.get("model", {}).get("dc", {})
-    elo_cfg = cfg.get("model", {}).get("elo", {})
-    ensemble_cfg = cfg.get("model", {}).get("ensemble", {})
+    model_cfg = cfg.get("model", {})
+    dc_cfg = model_cfg.get("dc", {})
+    elo_cfg = model_cfg.get("elo", {})
+    ensemble_cfg = model_cfg.get("ensemble", {})
     w_dc = ensemble_cfg.get("w_dc", 0.6)
     w_elo = ensemble_cfg.get("w_elo", 0.4)
 
-    for md in matchdays:
-        md = pd.to_datetime(md)
-        print(f"\n=== Matchday {md.date()} ===")
+    matchdays = get_matchdays_in_window(season_start, season_end)
 
-        # Training data: all historical matches strictly before this matchday
-        train_df = results_hist[results_hist["Date"] < md].copy()
-        if train_df.empty:
-            print("  Skipping – no training data before this date.")
+    if not matchdays:
+        print("No matchdays found in this date window.")
+        return
+
+    total_inserted = 0
+    skipped_small = 0
+
+    print("======================================================")
+    print(" Backfilling DC+Elo Predictions")
+    print("======================================================")
+    print(f" Season: {season_start} → {season_end or date.today()}")
+    print(f" Matchdays: {len(matchdays)}")
+    print("======================================================\n")
+
+    for idx, md in enumerate(matchdays, 1):
+        md_ts = pd.to_datetime(md)
+
+        print(f"[{idx}/{len(matchdays)}] Matchday: {md_ts.date()}")
+
+        # 1. Load training data
+        hist_df = load_results_up_to(md_ts)
+        n_hist = len(hist_df)
+
+        if n_hist < min_matches:
+            print(f"  - Skipping: only {n_hist} matches, need {min_matches}")
+            skipped_small += 1
             continue
 
-        # Fixtures on this matchday (from DB results)
-        fixtures = season_df[season_df["Date"] == md].copy()
+        print(f"  - Training on {n_hist} matches")
+        dc_model, elo_model = train_models(hist_df, dc_cfg, elo_cfg)
+
+        # 2. Load fixtures for this matchday
+        fixtures = load_matchday_fixtures(md_ts)
         if fixtures.empty:
-            print("  Skipping – no fixtures found in DB for this date.")
+            print("  - No fixtures found for this date.")
             continue
 
-        fixtures_df = fixtures[["Date", "home_team", "away_team"]].copy()
-        fixtures_df.rename(
-            columns={"home_team": "HomeTeam", "away_team": "AwayTeam"},
-            inplace=True,
-        )
-
-        # Train models
-        dc_model, elo_model = train_models(train_df, dc_cfg, elo_cfg)
-
-        # Predict for this matchday
+        print(f"  - Predicting {len(fixtures)} fixtures")
         preds_df = predict_fixtures(
-            fixtures_df,
+            fixtures,
             dc_model,
             elo_model,
             w_dc=w_dc,
@@ -237,16 +238,71 @@ def main():
         )
 
         if preds_df.empty:
-            print("  No predictions produced for this matchday.")
+            print("  - No predictions produced")
             continue
 
-        insert_backfill_predictions(preds_df, model_version=model_version)
-        total_inserted += len(preds_df)
-        print(f"  Inserted/updated {len(preds_df)} predictions.")
+        # 3. Insert to DB
+        model_version = f"dc_elo_backfill_{md_ts.strftime('%Y%m%d')}"
+        inserted_today = 0
 
-    print("\n==============================================")
-    print(f"Backfill complete. Total predictions inserted/updated: {total_inserted}")
-    print("==============================================\n")
+        for _, row in preds_df.iterrows():
+            date_str = pd.to_datetime(row["Date"]).strftime("%Y-%m-%d")
+            home = str(row["HomeTeam"])
+            away = str(row["AwayTeam"])
+
+            pH = float(row["pH"])
+            pD = float(row["pD"])
+            pA = float(row["pA"])
+            lamH = float(row["ExpHomeGoals"])
+            lamA = float(row["ExpAwayGoals"])
+            lamT = float(row.get("ExpTotalGoals", lamH + lamA))
+
+            score_pred = sample_score_from_xg(lamH, lamA)
+
+            insert_predictions(
+                {
+                    "date": date_str,
+                    "home_team": home,
+                    "away_team": away,
+                    "model_version": model_version,
+                    "dixon_coles_probs": "",
+                    "elo_probs": "",
+                    "ensemble_probs": "",
+                    "home_win_prob": pH,
+                    "draw_prob": pD,
+                    "away_win_prob": pA,
+                    "exp_goals_home": lamH,
+                    "exp_goals_away": lamA,
+                    "exp_total_goals": lamT,
+                    "score_pred": score_pred,
+                    "chatgpt_pred": None,
+                }
+            )
+
+            inserted_today += 1
+
+        total_inserted += inserted_today
+        print(f"  - Inserted {inserted_today} predictions\n")
+
+    print("======================================================")
+    print(" Backfill Complete")
+    print(f" Matchdays processed: {len(matchdays)}")
+    print(f" Skipped (small window): {skipped_small}")
+    print(f" Predictions inserted: {total_inserted}")
+    print("======================================================")
+
+
+# =====================================================================
+# Entrypoint
+# =====================================================================
+def main():
+    init_db()
+    args = parse_args()
+    backfill_model_predictions_for_season(
+        season_start=args.season_start,
+        season_end=args.season_end,
+        min_matches=args.min_matches,
+    )
 
 
 if __name__ == "__main__":

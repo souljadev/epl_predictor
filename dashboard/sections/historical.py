@@ -1,151 +1,99 @@
+import sqlite3
+from pathlib import Path
+from datetime import timedelta, date
+import numpy as pd
 import pandas as pd
 import streamlit as st
 
-from utils.loaders import load_comparison_from_db
+
+def load_historical(db_path: Path, days_back: int = 30) -> pd.DataFrame:
+    conn = sqlite3.connect(db_path)
+    df = pd.read_sql_query(
+        """
+        SELECT
+            r.date,
+            r.home_team,
+            r.away_team,
+            r.FTHG,
+            r.FTAG,
+            r.Result,
+            p.model_version,
+            p.home_win_prob,
+            p.draw_prob,
+            p.away_win_prob
+        FROM results r
+        LEFT JOIN predictions p
+          ON r.date = p.date
+         AND r.home_team = p.home_team
+         AND r.away_team = p.away_team
+        ORDER BY r.date DESC
+        """,
+        conn,
+    )
+    conn.close()
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    cutoff = pd.Timestamp(date.today() - timedelta(days=days_back))
+    df = df[df["date"] >= cutoff]
+
+    return df
 
 
-def section_historical_accuracy():
-    st.header("📈 Historical Accuracy – Model & ChatGPT")
-
-    # Load full comparison live from DB (predictions + results)
-    df = load_comparison_from_db()
-    if df.empty:
-        st.info("No comparison data found in DB. Make sure predictions and results exist.")
-        return
-
-    df = df.copy()
-    df = df.dropna(subset=["Date"])
-    if df.empty:
-        st.info("No valid dated rows in comparison data.")
-        return
-    # Only show rows with actual results (completed matches)
-    df = df[df["actual_winner"].notna()]
-
-    if df.empty:
-        st.info("No completed matches found in DB for this season.")
-        return
-
-
-    # ------------------------------------------------------------------------------------
-    # Convert winner codes (H/A/D) → actual team names
-    # ------------------------------------------------------------------------------------
-    def winner_to_team(row, val):
-        if val == "H":
-            return row["home_team"]
-        if val == "A":
-            return row["away_team"]
-        if val == "D":
-            return "Draw"
+def winner_from_goals(hg, ag):
+    if pd.isna(hg) or pd.isna(ag):
         return None
+    if hg > ag:
+        return "H"
+    if hg == ag:
+        return "D"
+    return "A"
 
-    df["Model Winner Name"] = df.apply(
-        lambda r: winner_to_team(r, r.get("model_winner_pred")), axis=1
-    )
-    df["Actual Winner Name"] = df.apply(
-        lambda r: winner_to_team(r, r.get("actual_winner")), axis=1
-    )
-    df["ChatGPT Winner Name"] = df.apply(
-        lambda r: winner_to_team(r, r.get("chatgpt_winner_pred")), axis=1
-    )
 
-    # ------------------------------------------------------------------------------------
-    # Model score
-    # ------------------------------------------------------------------------------------
-    if "score_pred" in df.columns:
-        df["Model Score"] = df["score_pred"].fillna("")
-    else:
-        df["Model Score"] = (
-            df["exp_goals_home"].fillna(0).round().astype(int).astype(str)
-            + "-"
-            + df["exp_goals_away"].fillna(0).round().astype(int).astype(str)
-        )
+def render(db_path: Path):
+    st.subheader("Historical Performance")
 
-    # ------------------------------------------------------------------------------------
-    # Actual score (if results exist)
-    # ------------------------------------------------------------------------------------
-    if {"FTHG", "FTAG"}.issubset(df.columns):
-        df["Actual Score"] = df["actual_score"].fillna("")
-    else:
-        df["Actual Score"] = None
+    days_back = st.slider("Lookback window (days)", min_value=7, max_value=365, value=60)
 
-    # ChatGPT score
-    df["ChatGPT Score"] = df.get("chatgpt_pred", "")
+    df = load_historical(db_path, days_back=days_back)
+    if df.empty:
+        st.info("No historical data found in that window.")
+        return
 
-    # ------------------------------------------------------------------------------------
-    # Accuracy metrics
-    # ------------------------------------------------------------------------------------
-    model_win_acc = df["correct_winner_model"].mean() if "correct_winner_model" in df else None
-    model_score_acc = df["correct_score_model"].mean() if "correct_score_model" in df else None
+    df["actual"] = df.apply(lambda r: winner_from_goals(r["FTHG"], r["FTAG"]), axis=1)
 
-    model_pred_miss_pct = (
-        (df["model_xg_error"] * 100).mean()
-        if "model_xg_error" in df else None
-    )
+    def predicted_label(row):
+        if pd.isna(row["home_win_prob"]):
+            return None
+        probs = [row["home_win_prob"], row["draw_prob"], row["away_win_prob"]]
+        idx = int(pd.Series(probs).idxmax())
+        return {0: "H", 1: "D", 2: "A"}[idx]
 
-    chat_cols_exist = (
-        "correct_winner_chatgpt" in df.columns and
-        "correct_score_chatgpt" in df.columns
-    )
+    df["predicted"] = df.apply(predicted_label, axis=1)
+    df["correct"] = df["actual"] == df["predicted"]
 
-    chat_win_acc = df["correct_winner_chatgpt"].mean() if chat_cols_exist else None
-    chat_score_acc = df["correct_score_chatgpt"].mean() if chat_cols_exist else None
-
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Model – Winner Accuracy",
-                f"{model_win_acc:.1%}" if model_win_acc is not None else "n/a")
-    col2.metric("Model – Exact Score Accuracy",
-                f"{model_score_acc:.1%}" if model_score_acc is not None else "n/a")
-    col3.metric("Prediction Miss (%)",
-                f"{model_pred_miss_pct:.0f}%" if model_pred_miss_pct is not None else "n/a")
-    col4.metric("ChatGPT – Winner Accuracy",
-                f"{chat_win_acc:.1%}" if chat_win_acc is not None else "n/a")
-    col5.metric("ChatGPT – Exact Score Accuracy",
-                f"{chat_score_acc:.1%}" if chat_score_acc is not None else "n/a")
-
-    # ------------------------------------------------------------------------------------
-    # Table construction
-    # ------------------------------------------------------------------------------------
-    desired_cols = [
-        "Date",
-        "home_team",
-        "away_team",
-        "Actual Score",
-        "Model Score",
-        "ChatGPT Score",
-        "Actual Winner Name",
-        "Model Winner Name",
-        "ChatGPT Winner Name",
-        "correct_winner_model",
-        "correct_score_model",
-        "correct_winner_chatgpt",
-        "correct_score_chatgpt",
-        "model_xg_error",
+    display_df = df[
+        [
+            "date",
+            "home_team",
+            "away_team",
+            "FTHG",
+            "FTAG",
+            "Result",
+            "model_version",
+            "home_win_prob",
+            "draw_prob",
+            "away_win_prob",
+            "actual",
+            "predicted",
+            "correct",
+        ]
     ]
 
-    existing_cols = [c for c in desired_cols if c in df.columns]
-    df_display = df[existing_cols].copy()
+    st.dataframe(display_df, use_container_width=True)
 
-    df_display.rename(columns={
-        "home_team": "Home",
-        "away_team": "Away",
-        "correct_winner_model": "Model Winner Correct?",
-        "correct_score_model": "Model Score Correct?",
-        "correct_winner_chatgpt": "ChatGPT Winner Correct?",
-        "correct_score_chatgpt": "ChatGPT Score Correct?",
-        "model_xg_error": "Prediction Miss (raw)",
-    }, inplace=True)
+    accuracy = df["correct"].mean(skipna=True)
+    st.markdown(f"**Hit rate over window:** `{accuracy:.3f}`")
 
-    # ------------------------------------------------------------------------------------
-    # SAFE % conversion (fixes your NaN error!)
-    # ------------------------------------------------------------------------------------
-    if "Prediction Miss (raw)" in df_display.columns:
-        df_display["Prediction Miss (%)"] = (
-            df_display["Prediction Miss (raw)"] * 100
-        ).round().apply(lambda x: f"{int(x)}%" if pd.notna(x) else "")
-        df_display.drop(columns=["Prediction Miss (raw)"], inplace=True)
-
-    # Sort newest first
-    df_display = df_display.sort_values("Date", ascending=False)
-
-    st.subheader("Matches with Model and/or ChatGPT Scores")
-    st.dataframe(df_display, use_container_width=True)
+    # Simple aggregate: correct vs incorrect count
+    summary = df["correct"].value_counts(dropna=True).rename(index={True: "Correct", False: "Incorrect"})
+    st.bar_chart(summary)
