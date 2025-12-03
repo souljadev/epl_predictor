@@ -4,6 +4,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from sklearn.metrics import brier_score_loss, log_loss
+from datetime import date
+
 
 SEASON_START = pd.Timestamp("2024-08-01")
 SEASON_END   = pd.Timestamp("2025-06-15")
@@ -54,6 +56,36 @@ def load_predictions(db_path: Path) -> pd.DataFrame:
 
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     return df.dropna(subset=["date"])
+
+def load_predictions_for_date(db_path: Path, target_ts: pd.Timestamp) -> pd.DataFrame:
+    conn = sqlite3.connect(db_path)
+    df = pd.read_sql_query(
+        """
+        SELECT
+            date,
+            home_team,
+            away_team,
+            model_version,
+            home_win_prob,
+            draw_prob,
+            away_win_prob,
+            exp_goals_home,
+            exp_goals_away,
+            exp_total_goals,
+            score_pred,
+            chatgpt_pred,
+            created_at
+        FROM predictions
+        WHERE date = ?
+        ORDER BY home_team, away_team, model_version
+        """,
+        conn,
+        params=(target_ts.strftime("%Y-%m-%d"),),
+    )
+    conn.close()
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    return df
 
 
 # ------------------------------------------------------------
@@ -165,11 +197,13 @@ def render(db_path: Path):
     # ------------------------------------------------------------
     # Display table
     # ------------------------------------------------------------
+    # Add probabilities to BOTH dataframes
+    merged["H Prob"] = (merged["home_win_prob"] * 100).round(1)
+    merged["D Prob"] = (merged["draw_prob"] * 100).round(1)
+    merged["A Prob"] = (merged["away_win_prob"] * 100).round(1)
+
     display_df = merged.copy()
 
-    display_df["H Prob"] = (display_df["home_win_prob"] * 100).round(1)
-    display_df["D Prob"] = (display_df["draw_prob"]   * 100).round(1)
-    display_df["A Prob"] = (display_df["away_win_prob"] * 100).round(1)
 
     display_df = display_df[
         [
