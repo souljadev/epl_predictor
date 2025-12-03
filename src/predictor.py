@@ -13,43 +13,45 @@ from models.ensemble import ensemble_win_probs
 ROOT = Path(__file__).resolve().parents[1]  # project root: soccer_agent_local/
 
 
+# =====================================================================
+# TRAIN MODELS
+# =====================================================================
+
 def train_models(
     results_df: pd.DataFrame,
-    dc_cfg: dict,
-    elo_cfg: dict,
+    dc_params: dict | None = None,
+    elo_params: dict | None = None,
 ) -> Tuple[DixonColesModel, EloModel]:
     """
-    Train Dixon–Coles and Elo models on historical results_df.
-    results_df must contain at least: Date, HomeTeam, AwayTeam, FTHG, FTAG.
+    Train Dixon-Coles and Elo models on a historical results DataFrame.
     """
+    dc_params = dc_params or {}
+    elo_params = elo_params or {}
 
-    # Basic cleaning
-    df = results_df.copy()
-    df = df.sort_values("Date").reset_index(drop=True)
-    df = df.dropna(subset=["FTHG", "FTAG"])
+    # ------------------------------------------------------------------
+    # DC model: keep only params that DixonColesModel actually supports
+    # ------------------------------------------------------------------
+    valid_dc_keys = {"rho_init", "home_adv_init"}  # filter to supported args
+    filtered_dc = {k: v for k, v in dc_params.items() if k in valid_dc_keys}
 
-    # Train Dixon–Coles
-    dc = DixonColesModel(
-        rho_init=dc_cfg.get("rho_init", 0.0),
-        home_adv_init=dc_cfg.get("home_adv_init", 0.15),
-        lr=dc_cfg.get("lr", 0.05),
-    )
-    use_xg = "Home_xG" in df.columns and "Away_xG" in df.columns
-    dc.fit(df, use_xg=use_xg)
+    dc_model = DixonColesModel(**filtered_dc)
+    dc_model.fit(results_df)
 
-    # Train Elo
-    elo = EloModel(
-        k_factor=elo_cfg.get("k_factor", 18.0),
-        home_advantage=elo_cfg.get("home_advantage", 55.0),
-        base_rating=elo_cfg.get("base_rating", 1500.0),
-        draw_base=elo_cfg.get("draw_base", 0.25),
-        draw_max_extra=elo_cfg.get("draw_max_extra", 0.10),
-        draw_scale=elo_cfg.get("draw_scale", 400.0),
-    )
-    elo.fit(df)
+    # ------------------------------------------------------------------
+    # Elo model: usually only supports k_factor
+    # ------------------------------------------------------------------
+    valid_elo_keys = {"k_factor"}
+    filtered_elo = {k: v for k, v in elo_params.items() if k in valid_elo_keys}
 
-    return dc, elo
+    elo_model = EloModel(**filtered_elo)
+    elo_model.fit(results_df)
 
+    return dc_model, elo_model
+
+
+# =====================================================================
+# PREDICT FIXTURES (UPDATED WITH CONTEXT-AWARE DRAW CALIBRATION)
+# =====================================================================
 
 def predict_fixtures(
     fixtures_df: pd.DataFrame,
@@ -61,27 +63,37 @@ def predict_fixtures(
     """
     Predict probabilities and expected goals for a set of fixtures
     using the provided Dixon–Coles and Elo models.
-    fixtures_df must contain: Date, HomeTeam, AwayTeam.
+
+    fixtures_df must contain:
+        Date, HomeTeam, AwayTeam
     """
 
     rows = []
+
     for _, row in fixtures_df.iterrows():
         home = row["HomeTeam"]
         away = row["AwayTeam"]
 
+        # ------------------------------------------------------------
+        # 1. DC expected goals + probabilities
+        # ------------------------------------------------------------
         try:
             lamH, lamA = dc_model.predict_expected_goals(home, away)
             pH_dc, pD_dc, pA_dc = dc_model.predict(home, away)
         except Exception:
-            # Skip if DC cannot handle this fixture
             continue
 
+        # ------------------------------------------------------------
+        # 2. Elo probabilities
+        # ------------------------------------------------------------
         try:
             pH_elo, pD_elo, pA_elo = elo_model.predict(home, away)
         except Exception:
-            # Skip if Elo cannot handle this fixture
             continue
 
+        # ------------------------------------------------------------
+        # 3. Raw Ensemble (same logic you already use)
+        # ------------------------------------------------------------
         pH, pD, pA = ensemble_win_probs(
             (pH_dc, pD_dc, pA_dc),
             (pH_elo, pD_elo, pA_elo),
@@ -89,6 +101,58 @@ def predict_fixtures(
             w_elo=w_elo,
         )
 
+        # =====================================================================
+        # 4. CONTEXT-AWARE DRAW CALIBRATION
+        # =====================================================================
+
+        # STEP 1 — Mild global correction
+        pD *= 1.20  # +20% baseline boost
+
+        # Compute context features
+        goal_diff = abs(lamH - lamA)
+        total_goals = lamH + lamA
+
+        # ------------------------------------------------------------
+        # NEW STEP — reduce overconfidence in close matchups
+        # ------------------------------------------------------------
+        if goal_diff < 0.40:
+            pH *= 0.93
+            pA *= 0.93
+
+        if total_goals < 2.40:
+            pH *= 0.95
+            pA *= 0.95
+
+
+        # STEP 2 — Close match: more draws
+        if goal_diff < 0.40:
+            pD *= 1.28  # was +35%
+
+        # STEP 3 — Low scoring match: more draws
+        if total_goals < 2.40:
+            pD *= 1.20   # was +15%
+
+        # STEP 4 — Ultra-close AND ultra-low
+        if goal_diff < 0.25 and total_goals < 2.20:
+            pD *= 1.15   # +15%
+
+        # STEP 5 — Blend with historical EPL draw rate
+        epl_draw_rate = 0.24
+        blend_weight = 0.10
+        pD = (1 - blend_weight) * pD + blend_weight * epl_draw_rate
+
+        # STEP 6 — Renormalize to sum to 1
+        Z = pH + pD + pA
+        if Z > 0:
+            pH /= Z
+            pD /= Z
+            pA /= Z
+        else:
+            pH = pD = pA = 1 / 3
+
+        # ------------------------------------------------------------
+        # 5. Store results
+        # ------------------------------------------------------------
         rows.append(
             {
                 "Date": row["Date"],

@@ -121,7 +121,7 @@ def compute_metrics(df):
     df = df.copy()
     df["actual"] = df.apply(lambda r: winner_from_goals(r["FTHG"], r["FTAG"]), axis=1)
 
-    # predicted class (index of max prob)
+    # predicted class index
     df["predicted"] = df.apply(
         lambda r: np.argmax([r["home_win_prob"], r["draw_prob"], r["away_win_prob"]]),
         axis=1
@@ -133,20 +133,23 @@ def compute_metrics(df):
     y_true = df["actual_idx"].values
     probs = df[["home_win_prob", "draw_prob", "away_win_prob"]].values
 
+    # --------------------------
     # Accuracy
+    # --------------------------
     accuracy = (df["predicted"] == df["actual_idx"]).mean()
 
-    # Brier score — must specify all classes
-    try:
-        brier = brier_score_loss(
-            y_true,
-            probs,
-            labels=[0, 1, 2]
-        )
-    except:
-        brier = np.nan
+    # --------------------------
+    # Draw accuracy (precision)
+    # --------------------------
+    draw_mask = df["predicted"] == 1
+    if draw_mask.sum() == 0:
+        draw_acc = np.nan
+    else:
+        draw_acc = (df.loc[draw_mask, "actual_idx"] == 1).mean()
 
-    # Log loss — must specify all classes
+    # --------------------------
+    # Multiclass log loss
+    # --------------------------
     eps = 1e-12
     probs_clipped = np.clip(probs, eps, 1 - eps)
 
@@ -156,11 +159,18 @@ def compute_metrics(df):
             probs_clipped,
             labels=[0, 1, 2]
         )
-    except:
+    except Exception:
         ll = np.nan
 
-    return accuracy, brier, ll
+    # --------------------------
+    # Multiclass Brier score
+    # --------------------------
+    onehot = np.zeros_like(probs)
+    onehot[np.arange(len(y_true)), y_true] = 1
 
+    brier = ((probs - onehot) ** 2).sum(axis=1).mean()
+
+    return accuracy, draw_acc, brier, ll
 
 
 # =====================================================================
@@ -194,7 +204,7 @@ def run_comparison():
     # Evaluate overall (using all model_version mixed)
     # ------------------------------------------------------------------
     print("Evaluating DC+Elo Ensemble Model:")
-    acc, brier, ll = compute_metrics(merged)
+    acc, draw_acc, brier, ll = compute_metrics(merged)
 
     print(f"  Accuracy:      {acc:.4f}")
     print(f"  Brier Score:   {brier:.4f}")
@@ -211,12 +221,13 @@ def run_comparison():
         if df_mv.empty:
             continue
 
-        acc, brier, ll = compute_metrics(df_mv)
+        acc, draw_acc, brier, ll = compute_metrics(df_mv)
         print(f"\nModel {mv}:")
         print(f"  Samples:       {len(df_mv)}")
         print(f"  Accuracy:      {acc:.4f}")
         print(f"  Brier Score:   {brier:.4f}")
         print(f"  Log Loss:      {ll:.4f}")
+        print(f"  Draw Accuracy:   {draw_acc:.4f}")
 
     print("\n============================================")
     print(" Evaluation Complete")

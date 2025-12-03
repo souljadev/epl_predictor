@@ -63,20 +63,30 @@ def winner_from_goals(hg, ag):
 def compute_metrics(df: pd.DataFrame):
     df = df.copy()
     df["actual"] = df.apply(lambda r: winner_from_goals(r["FTHG"], r["FTAG"]), axis=1)
+
     df["predicted_class"] = df.apply(
         lambda r: np.argmax(
             [r["home_win_prob"], r["draw_prob"], r["away_win_prob"]]
         ),
         axis=1,
     )
+
     df["actual_idx"] = df["actual"].map({"H": 0, "D": 1, "A": 2})
 
     y_true = df["actual_idx"].values
     probs = df[["home_win_prob", "draw_prob", "away_win_prob"]].values
 
+    # Accuracy
     accuracy = (df["predicted_class"] == df["actual_idx"]).mean()
 
-    # Multiclass Brier & Log-loss need labels specified
+    # Draw accuracy
+    draw_rows = df[df["actual"] == "D"]
+    if len(draw_rows) == 0:
+        draw_acc = float("nan")
+    else:
+        draw_acc = (draw_rows["predicted_class"] == 1).mean()
+
+    # Brier score
     try:
         brier = brier_score_loss(
             y_true,
@@ -86,6 +96,7 @@ def compute_metrics(df: pd.DataFrame):
     except Exception:
         brier = np.nan
 
+    # Log loss
     eps = 1e-12
     probs_clip = np.clip(probs, eps, 1 - eps)
     try:
@@ -97,7 +108,7 @@ def compute_metrics(df: pd.DataFrame):
     except Exception:
         ll = np.nan
 
-    return accuracy, brier, ll
+    return accuracy, draw_acc, brier, ll
 
 
 def render(db_path: Path):
@@ -115,8 +126,8 @@ def render(db_path: Path):
     ].copy()
 
     preds = preds[
-        (preds["date"] >= SEASON_START)
-        & (preds["date"] <= SEASON_END)
+    (preds["date"] >= SEASON_START)
+    & (preds["date"] <= SEASON_END)
     ].copy()
 
     merged = results.merge(
@@ -132,24 +143,27 @@ def render(db_path: Path):
     st.write(f"Matched rows: **{len(merged)}**")
 
     # Overall metrics
-    acc, brier, ll = compute_metrics(merged)
+    acc, draw_acc, brier, ll = compute_metrics(merged)
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Overall Accuracy", f"{acc:.3f}")
     col2.metric("Brier Score", f"{brier:.3f}")
     col3.metric("Log Loss", f"{ll:.3f}")
 
+    st.metric("Draw Accuracy", f"{draw_acc:.3f}")
+
     # By model_version
     st.markdown("### Metrics by Model Version")
 
     rows = []
     for mv, df_mv in merged.groupby("model_version"):
-        acc_mv, brier_mv, ll_mv = compute_metrics(df_mv)
+        acc_mv, draw_acc_mv, brier_mv, ll_mv = compute_metrics(df_mv)
         rows.append(
             {
                 "model_version": mv,
                 "n_matches": len(df_mv),
                 "accuracy": acc_mv,
+                "draw_accuracy": draw_acc_mv,
                 "brier": brier_mv,
                 "log_loss": ll_mv,
             }
