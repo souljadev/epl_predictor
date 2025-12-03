@@ -2,6 +2,7 @@ import sys
 import sqlite3
 from pathlib import Path
 from datetime import datetime, date
+import math
 
 import numpy as np
 import pandas as pd
@@ -40,13 +41,6 @@ def load_config() -> dict:
 # TRAINING DATA FROM DB
 # ------------------------------------------------------------
 def load_training_results_from_db() -> pd.DataFrame:
-    """
-    Load historical results from SQLite for model training.
-    Uses DB.results as the single source of truth.
-
-    Expects columns: date, home_team, away_team, FTHG, FTAG
-    Returns: DataFrame with columns [Date, HomeTeam, AwayTeam, FTHG, FTAG]
-    """
     if not DB_PATH.exists():
         raise FileNotFoundError(f"SQLite DB not found at {DB_PATH}")
 
@@ -66,7 +60,6 @@ def load_training_results_from_db() -> pd.DataFrame:
     df["Date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["Date"])
 
-    # Only use completed matches (defensive, but results should already be only completed)
     df = df.dropna(subset=["FTHG", "FTAG"]).copy()
 
     df.rename(
@@ -84,13 +77,6 @@ def load_training_results_from_db() -> pd.DataFrame:
 # FIXTURES FROM DB
 # ------------------------------------------------------------
 def prepare_fixtures_for_model(fixtures_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert DB fixtures (date, home_team, away_team) into the shape
-    expected by predict_fixtures:
-      - Date (datetime64)
-      - HomeTeam
-      - AwayTeam
-    """
     if fixtures_df.empty:
         return fixtures_df
 
@@ -112,7 +98,6 @@ def prepare_fixtures_for_model(fixtures_df: pd.DataFrame) -> pd.DataFrame:
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df = df.dropna(subset=["Date"])
 
-    # Safety: only keep fixtures today or later
     today = pd.Timestamp(date.today())
     df = df[df["Date"] >= today].copy()
 
@@ -120,24 +105,47 @@ def prepare_fixtures_for_model(fixtures_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------
-# SCORE SAMPLING (Poisson-based, balanced option B)
+# POISSON HELPERS (DETERMINISTIC SCORE)
 # ------------------------------------------------------------
-def sample_score_from_xg(lamH: float, lamA: float) -> str:
-    """
-    Sample a plausible scoreline from expected goals using independent
-    Poisson draws for home and away goals.
-
-    If lambdas are invalid, fall back to rounded xG.
-    """
+def poisson_pmf(k: int, lam: float) -> float:
+    """Simple Poisson PMF without external deps."""
+    if lam < 0 or not math.isfinite(lam) or k < 0:
+        return 0.0
     try:
-        if lamH < 0 or lamA < 0 or not np.isfinite(lamH) or not np.isfinite(lamA):
-            raise ValueError
-        h = np.random.poisson(lamH)
-        a = np.random.poisson(lamA)
-    except Exception:
-        h = int(round(lamH if np.isfinite(lamH) else 1.0))
-        a = int(round(lamA if np.isfinite(lamA) else 1.0))
-    return f"{h}-{a}"
+        return math.exp(-lam) * (lam ** k) / math.factorial(k)
+    except OverflowError:
+        return 0.0
+
+
+def most_likely_score_from_xg(lamH: float, lamA: float, max_goals: int = 6) -> str:
+    """
+    Deterministic: pick the most likely (home_goals, away_goals) pair
+    under independent Poisson(lamH) and Poisson(lamA), capped at max_goals.
+    This replaces random sampling and avoids silly 7-0 type tails.
+    """
+    # Basic sanity / fallback
+    if not np.isfinite(lamH) or lamH < 0:
+        lamH = 1.0
+    if not np.isfinite(lamA) or lamA < 0:
+        lamA = 1.0
+
+    best_p = -1.0
+    best_h = 0
+    best_a = 0
+
+    # Precompute PMFs for efficiency
+    pH_vals = [poisson_pmf(h, lamH) for h in range(max_goals + 1)]
+    pA_vals = [poisson_pmf(a, lamA) for a in range(max_goals + 1)]
+
+    for h in range(max_goals + 1):
+        for a in range(max_goals + 1):
+            p = pH_vals[h] * pA_vals[a]
+            if p > best_p:
+                best_p = p
+                best_h = h
+                best_a = a
+
+    return f"{best_h}-{best_a}"
 
 
 # ------------------------------------------------------------
@@ -172,20 +180,10 @@ def parse_args():
 # CORE PIPELINE
 # ------------------------------------------------------------
 def run_model_predictions(days_ahead: int = 7, run_id: str | None = None) -> pd.DataFrame:
-    """
-    1) Load config
-    2) Load historical results from DB.results
-    3) Train DC + Elo models
-    4) Fetch upcoming fixtures from DB.fixtures
-    5) Predict probs + xG via predict_fixtures
-    6) Upsert predictions into unified DB.predictions
-    """
     cfg = load_config()
 
-    # 1) Training data (DB-only)
     results_hist = load_training_results_from_db()
 
-    # 2) Model configuration
     model_cfg = cfg.get("model", {})
     dc_cfg = model_cfg.get("dc", {})
     elo_cfg = model_cfg.get("elo", {})
@@ -193,22 +191,18 @@ def run_model_predictions(days_ahead: int = 7, run_id: str | None = None) -> pd.
     w_dc = ensemble_cfg.get("w_dc", 0.6)
     w_elo = ensemble_cfg.get("w_elo", 0.4)
 
-    # 3) Train models
     dc_model, elo_model = train_models(results_hist, dc_cfg, elo_cfg)
 
-    # 4) Upcoming fixtures from DB
     fixtures_db = get_upcoming_fixtures(days_ahead=days_ahead)
     if fixtures_db.empty:
         print("No upcoming fixtures found in DB for the given window.")
         return pd.DataFrame()
 
     fixtures_for_model = prepare_fixtures_for_model(fixtures_db)
-
     if fixtures_for_model.empty:
         print("No valid fixtures after cleaning (dates/team names).")
         return pd.DataFrame()
 
-    # 5) Predict using DC+Elo ensemble
     preds_df = predict_fixtures(
         fixtures_for_model,
         dc_model,
@@ -221,7 +215,6 @@ def run_model_predictions(days_ahead: int = 7, run_id: str | None = None) -> pd.
         print("predict_fixtures returned no rows.")
         return pd.DataFrame()
 
-    # 6) Upsert into unified predictions table
     model_version = f"dc_elo_ensemble_live_{datetime.utcnow().strftime('%Y%m%d')}"
 
     for _, row in preds_df.iterrows():
@@ -236,15 +229,14 @@ def run_model_predictions(days_ahead: int = 7, run_id: str | None = None) -> pd.
         lamA = float(row["ExpAwayGoals"])
         lamT = float(row.get("ExpTotalGoals", lamH + lamA))
 
-        # Balanced Option B: Poisson-based score sampling from xG
-        score_pred = sample_score_from_xg(lamH, lamA)
+        # NEW: deterministic, most likely score rather than random sample
+        score_pred = most_likely_score_from_xg(lamH, lamA, max_goals=6)
 
         row_dict = {
             "date": date_str,
             "home_team": home,
             "away_team": away,
             "model_version": model_version,
-            # Keeping these as empty strings for now; can store JSON later if needed
             "dixon_coles_probs": "",
             "elo_probs": "",
             "ensemble_probs": "",
@@ -254,9 +246,8 @@ def run_model_predictions(days_ahead: int = 7, run_id: str | None = None) -> pd.
             "exp_goals_home": lamH,
             "exp_goals_away": lamA,
             "exp_total_goals": lamT,
-            "score_pred": score_pred,
-            # ChatGPT fills this later
-            "chatgpt_pred": None,
+            "score_pred": score_pred,   # model's deterministic correct score
+            "chatgpt_pred": None,       # ChatGPT fills this later
         }
 
         insert_predictions(row_dict)
@@ -268,7 +259,6 @@ def run_model_predictions(days_ahead: int = 7, run_id: str | None = None) -> pd.
 # CLI ENTRYPOINT
 # ------------------------------------------------------------
 def main():
-    # Ensure DB exists & schema is up to date
     init_db()
 
     days_ahead, run_id = parse_args()

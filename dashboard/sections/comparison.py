@@ -6,34 +6,34 @@ import streamlit as st
 from sklearn.metrics import brier_score_loss, log_loss
 
 SEASON_START = pd.Timestamp("2024-08-01")
-SEASON_END = pd.Timestamp("2025-06-15")
+SEASON_END   = pd.Timestamp("2025-06-15")
 
 EPL_TEAMS_2024 = {
-    "Arsenal","Aston Villa","Bournemouth","Brentford","Brighton","Chelsea","Crystal Palace",
-    "Everton","Fulham","Ipswich","Leicester","Liverpool","Man City","Man United",
-    "Newcastle","Nott'm Forest","Southampton","Tottenham","West Ham","Wolves"
+    "Arsenal","Aston Villa","Bournemouth","Brentford","Brighton","Chelsea",
+    "Crystal Palace","Everton","Fulham","Ipswich","Leicester",
+    "Liverpool","Man City","Man United","Newcastle",
+    "Nott'm Forest","Southampton","Tottenham","West Ham","Wolves"
 }
 
 
+# ------------------------------------------------------------
+# DB LOAD
+# ------------------------------------------------------------
 def load_results(db_path: Path) -> pd.DataFrame:
     conn = sqlite3.connect(db_path)
-    df = pd.read_sql_query(
-        """
+    df = pd.read_sql_query("""
         SELECT date, home_team, away_team, FTHG, FTAG, Result
         FROM results
-        """,
-        conn,
-    )
+    """, conn)
     conn.close()
+
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date"])
-    return df
+    return df.dropna(subset=["date"])
 
 
 def load_predictions(db_path: Path) -> pd.DataFrame:
     conn = sqlite3.connect(db_path)
-    df = pd.read_sql_query(
-        """
+    df = pd.read_sql_query("""
         SELECT
             date,
             home_team,
@@ -41,140 +41,178 @@ def load_predictions(db_path: Path) -> pd.DataFrame:
             model_version,
             home_win_prob,
             draw_prob,
-            away_win_prob
+            away_win_prob,
+            exp_goals_home,
+            exp_goals_away,
+            exp_total_goals,
+            score_pred,
+            chatgpt_pred,
+            created_at
         FROM predictions
-        """,
-        conn,
-    )
+    """, conn)
     conn.close()
+
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date"])
-    return df
+    return df.dropna(subset=["date"])
 
 
-def winner_from_goals(hg, ag):
-    if hg > ag:
+# ------------------------------------------------------------
+# HELPERS
+# ------------------------------------------------------------
+def winner_from_goals(h, a):
+    if h > a:
         return "H"
-    if hg == ag:
+    if h == a:
         return "D"
     return "A"
 
 
+def winner_from_score(score):
+    try:
+        h, a = map(int, score.split("-"))
+        return winner_from_goals(h, a)
+    except:
+        return None
+
+
+# ------------------------------------------------------------
+# METRICS
+# ------------------------------------------------------------
 def compute_metrics(df: pd.DataFrame):
+    if df.empty:
+        return 0, 0, 0
+
     df = df.copy()
     df["actual"] = df.apply(lambda r: winner_from_goals(r["FTHG"], r["FTAG"]), axis=1)
 
-    df["predicted_class"] = df.apply(
-        lambda r: np.argmax(
-            [r["home_win_prob"], r["draw_prob"], r["away_win_prob"]]
-        ),
+    # Use model probabilities only (dc_elo)
+    df = df[df["model_version"].str.startswith("dc_elo")]
+
+    if df.empty:
+        return 0, 0, 0
+
+    df["actual_idx"] = df["actual"].map({"H":0, "D":1, "A":2})
+    df["pred_class"] = df.apply(
+        lambda r: np.argmax([r["home_win_prob"], r["draw_prob"], r["away_win_prob"]]),
         axis=1,
     )
 
-    df["actual_idx"] = df["actual"].map({"H": 0, "D": 1, "A": 2})
+    accuracy = (df["pred_class"] == df["actual_idx"]).mean()
 
     y_true = df["actual_idx"].values
-    probs = df[["home_win_prob", "draw_prob", "away_win_prob"]].values
+    probs  = df[["home_win_prob","draw_prob","away_win_prob"]].values
 
-    # Accuracy
-    accuracy = (df["predicted_class"] == df["actual_idx"]).mean()
-
-    # Draw accuracy
-    draw_rows = df[df["actual"] == "D"]
-    if len(draw_rows) == 0:
-        draw_acc = float("nan")
-    else:
-        draw_acc = (draw_rows["predicted_class"] == 1).mean()
-
-    # Brier score
     try:
-        brier = brier_score_loss(
-            y_true,
-            probs,
-            labels=[0, 1, 2],
-        )
-    except Exception:
+        brier = brier_score_loss(y_true, probs, labels=[0,1,2])
+    except:
         brier = np.nan
 
-    # Log loss
-    eps = 1e-12
-    probs_clip = np.clip(probs, eps, 1 - eps)
     try:
-        ll = log_loss(
-            y_true,
-            probs_clip,
-            labels=[0, 1, 2],
-        )
-    except Exception:
+        ll = log_loss(y_true, probs, labels=[0,1,2])
+    except:
         ll = np.nan
 
-    return accuracy, draw_acc, brier, ll
+    return accuracy, brier, ll
 
 
+# ------------------------------------------------------------
+# RENDER
+# ------------------------------------------------------------
 def render(db_path: Path):
-    st.subheader("Model Comparison — Current EPL Season")
+    st.subheader("Match Predictions")
 
-    results = load_results(db_path)
-    preds = load_predictions(db_path)
-
-    # Filter by season + team membership
-    results = results[
-        (results["date"] >= SEASON_START)
-        & (results["date"] <= SEASON_END)
-        & (results["home_team"].isin(EPL_TEAMS_2024))
-        & (results["away_team"].isin(EPL_TEAMS_2024))
-    ].copy()
-
-    preds = preds[
-    (preds["date"] >= SEASON_START)
-    & (preds["date"] <= SEASON_END)
-    ].copy()
-
-    merged = results.merge(
-        preds,
-        on=["date", "home_team", "away_team"],
-        how="inner",
+    today = date.today()
+    selected_date = st.date_input(
+        "Select match date",
+        value=today,
     )
 
-    if merged.empty:
-        st.warning("No overlapping rows between predictions and results for this season.")
+    target_ts = pd.to_datetime(selected_date)
+
+    df = load_predictions_for_date(db_path, target_ts)
+
+    if df.empty:
+        st.info("No predictions found for this date. Generate predictions first.")
         return
 
-    st.write(f"Matched rows: **{len(merged)}**")
+    st.markdown(f"### Predictions for {target_ts.date()}")
 
-    # Overall metrics
-    acc, draw_acc, brier, ll = compute_metrics(merged)
+    # ------------------------------------------------------------
+    # Fix duplicates: pivot ChatGPT joins horizontally
+    # ------------------------------------------------------------
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Overall Accuracy", f"{acc:.3f}")
-    col2.metric("Brier Score", f"{brier:.3f}")
-    col3.metric("Log Loss", f"{ll:.3f}")
+    model_df = df[df["model_version"].str.startswith("dc_elo")].copy()
+    gpt_df   = df[df["model_version"] == "chatgpt"].copy()
 
-    st.metric("Draw Accuracy", f"{draw_acc:.3f}")
+    # Rename columns to avoid confusion
+    model_df = model_df.rename(columns={
+        "score_pred": "model_score"
+    })
+    gpt_df = gpt_df.rename(columns={
+        "chatgpt_pred": "chatgpt_score"
+    })
 
-    # By model_version
-    st.markdown("### Metrics by Model Version")
+    # Only keep ChatGPT's score for merge
+    gpt_df = gpt_df[["date","home_team","away_team","chatgpt_score"]]
 
-    rows = []
-    for mv, df_mv in merged.groupby("model_version"):
-        acc_mv, draw_acc_mv, brier_mv, ll_mv = compute_metrics(df_mv)
-        rows.append(
-            {
-                "model_version": mv,
-                "n_matches": len(df_mv),
-                "accuracy": acc_mv,
-                "draw_accuracy": draw_acc_mv,
-                "brier": brier_mv,
-                "log_loss": ll_mv,
-            }
-        )
-
-    mv_df = pd.DataFrame(rows).sort_values("accuracy", ascending=False)
-    st.dataframe(mv_df, use_container_width=True)
-
-    # Simple chart: accuracy by model_version
-    st.markdown("#### Accuracy by Model Version")
-    st.bar_chart(
-        mv_df.set_index("model_version")["accuracy"],
-        use_container_width=True,
+    # Merge → ONE ROW PER MATCH
+    merged = model_df.merge(
+        gpt_df,
+        on=["date","home_team","away_team"],
+        how="left"
     )
+
+    # ------------------------------------------------------------
+    # Display table
+    # ------------------------------------------------------------
+    display_df = merged.copy()
+
+    display_df["H Prob"] = (display_df["home_win_prob"] * 100).round(1)
+    display_df["D Prob"] = (display_df["draw_prob"]   * 100).round(1)
+    display_df["A Prob"] = (display_df["away_win_prob"] * 100).round(1)
+
+    display_df = display_df[
+        [
+            "date",
+            "home_team",
+            "away_team",
+            "model_version",
+            "H Prob", "D Prob", "A Prob",
+            "exp_goals_home",
+            "exp_goals_away",
+            "exp_total_goals",
+            "model_score",
+            "chatgpt_score",
+        ]
+    ]
+
+    st.dataframe(display_df, use_container_width=True)
+
+    # ------------------------------------------------------------
+    # Expanders (1 per match)
+    # ------------------------------------------------------------
+    st.markdown("#### Per-match details")
+
+    for _, row in merged.iterrows():
+        with st.expander(
+            f"{row['home_team']} vs {row['away_team']} — "
+            f"{row['H Prob']:.1f}% / "
+            f"{row['D Prob']:.1f}% / "
+            f"{row['A Prob']:.1f}%"
+        ):
+            st.write(f"**Model version:** `{row['model_version']}`")
+            st.write(
+                f"**Probabilities** – Home: `{row['home_win_prob']:.3f}`, "
+                f"Draw: `{row['draw_prob']:.3f}`, "
+                f"Away: `{row['away_win_prob']:.3f}`"
+            )
+            st.write(
+                f"**Expected goals** – Home: `{row['exp_goals_home']:.2f}`, "
+                f"Away: `{row['exp_goals_away']:.2f}`, "
+                f"Total: `{row['exp_total_goals']:.2f}`"
+            )
+            st.write(f"**Model score:** `{row['model_score']}`")
+            if row["chatgpt_score"]:
+                st.write(f"**ChatGPT score:** `{row['chatgpt_score']}`")
+            else:
+                st.write("_No ChatGPT prediction for this match._")
