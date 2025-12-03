@@ -305,3 +305,92 @@ def insert_model_predictions(df: pd.DataFrame, run_id: str, run_ts: str):
         }
 
         insert_predictions(row_dict)
+
+# ------------------------------------------------------------
+# GET TRAINING MATCHES (fixtures + results joined)
+# ------------------------------------------------------------
+def get_training_matches() -> pd.DataFrame:
+    """
+    Returns historical match results joined with fixture metadata.
+
+    Output columns:
+        Date, HomeTeam, AwayTeam, FTHG, FTAG, Result
+    """
+
+    with get_conn() as conn:
+        df = pd.read_sql_query(
+            """
+            SELECT 
+                f.date AS Date,
+                f.home_team AS HomeTeam,
+                f.away_team AS AwayTeam,
+                r.FTHG,
+                r.FTAG,
+                r.Result
+            FROM fixtures f
+            JOIN results r
+              ON f.date = r.date
+             AND f.home_team = r.home_team
+             AND f.away_team = r.away_team
+            ORDER BY f.date
+            """,
+            conn,
+        )
+
+    # Convert Date to datetime
+    if not df.empty:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+
+    return df
+
+# ------------------------------------------------------------
+# SAVE / LOAD MODEL PARAMETERS (DC + ELO)
+# ------------------------------------------------------------
+def save_dc_params(params: dict):
+    """
+    Saves Dixon–Coles parameters to models/dc_params.json
+    """
+    path = ROOT / "models" / "dc_params.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(path, "w") as f:
+        json.dump(params, f)
+
+    return True
+
+
+def save_elo_params(params: dict):
+    """
+    Saves Elo parameters to models/elo_params.json
+    """
+    path = ROOT / "models" / "elo_params.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(path, "w") as f:
+        json.dump(params, f)
+
+    return True
+
+
+def load_dc_params():
+    """
+    Loads DC params from stored JSON.
+    """
+    path = ROOT / "models" / "dc_params.json"
+    if not path.exists():
+        return None
+
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def load_elo_params():
+    """
+    Loads Elo params from stored JSON.
+    """
+    path = ROOT / "models" / "elo_params.json"
+    if not path.exists():
+        return None
+
+    with open(path, "r") as f:
+        return json.load(f)

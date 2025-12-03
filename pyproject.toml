@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "soccer_agent_local"
+version = "0.1.0"
+description = "EPL prediction agent"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = ["src"]
+package-dir = {"" = "."}
