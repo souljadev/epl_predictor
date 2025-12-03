@@ -83,215 +83,205 @@ def load_predictions_for_date(db_path: Path, target_date: pd.Timestamp) -> pd.Da
 # RENDER PREDICTIONS PAGE
 # ------------------------------------------------------------
 def render(db_path: Path):
-    st.subheader("Match Predictions")
+    st.subheader("Upcoming Predictions (Next 2 Matchdays)")
 
-    today = date.today()
-    selected_date = st.date_input("Select match date", value=today)
-    target_ts = pd.to_datetime(selected_date)
+    # --------------------------------------------------------
+    # Find next 2 matchdays with predictions available
+    # --------------------------------------------------------
+    conn = sqlite3.connect(db_path)
+    df_dates = pd.read_sql_query(
+        """
+        SELECT DISTINCT date 
+        FROM predictions
+        WHERE date >= DATE('now')
+        ORDER BY date ASC
+        """,
+        conn,
+    )
+    conn.close()
 
-    df = load_predictions_for_date(db_path, target_ts)
-
-    if df.empty:
-        st.info("No predictions for this date.")
+    if df_dates.empty:
+        st.info("No upcoming predictions found in the database.")
         return
 
-    st.markdown(f"### Predictions for {target_ts.date()}")
+    # Get next 2 unique match dates
+    upcoming_dates = (
+        df_dates["date"]
+        .drop_duplicates()
+        .sort_values()
+        .head(2)
+        .tolist()
+    )
+
+    st.markdown(f"### Showing matchdays: {', '.join(upcoming_dates)}")
 
     # --------------------------------------------------------
-    # SPLIT MODEL vs CHATGPT
+    # Iterate through the next two matchdays
     # --------------------------------------------------------
-    model_df = df[df["score_pred"].notna()].copy()
-    gpt_df   = df[df["chatgpt_pred"].notna()].copy()
+    for d in upcoming_dates:
+        date_ts = pd.to_datetime(d)
 
-    # --------------------------------------------------------
-    # DEDUPE MODEL ROWS — CHOOSE SCORE CLOSEST TO xG
-    # --------------------------------------------------------
-    def pick_best_model_row(group: pd.DataFrame) -> pd.Series:
-        """
-        For all model rows of the same match, pick the score_pred
-        that is closest to (exp_goals_home, exp_goals_away).
-        """
-        best_idx = None
-        best_err = None
+        st.markdown(f"## Matchday — {date_ts.date()}")
 
-        for idx, row in group.iterrows():
-            h, a = parse_score(row["score_pred"])
-            if h is None or a is None:
-                continue
-            lamH = float(row["exp_goals_home"])
-            lamA = float(row["exp_goals_away"])
-            err = (h - lamH) ** 2 + (a - lamA) ** 2
-            if best_err is None or err < best_err:
-                best_err = err
-                best_idx = idx
+        df = load_predictions_for_date(db_path, date_ts)
 
-        # fallback: if none parsable, just take first
-        if best_idx is None:
-            return group.iloc[0]
-        return group.loc[best_idx]
+        if df.empty:
+            st.info(f"No predictions for {date_ts.date()}.")
+            continue
 
-    if not model_df.empty:
-        model_df = (
-            model_df.groupby(["date", "home_team", "away_team"], as_index=False)
-            .apply(pick_best_model_row)
-            .reset_index(drop=True)
+        # ----------------------------------------------------
+        # SAME logic as before — SPLIT / DEDUPE / MERGE / DISPLAY
+        # (your existing block goes here unchanged)
+        # ----------------------------------------------------
+
+        # --- 1. Split model vs ChatGPT ---
+        model_df = df[df["score_pred"].notna()].copy()
+        gpt_df   = df[df["chatgpt_pred"].notna()].copy()
+
+        # --- 2. Smart dedupe model versions ---
+        def pick_best_model_row(group: pd.DataFrame) -> pd.Series:
+            best_idx = None
+            best_err = None
+            for idx, row in group.iterrows():
+                h, a = parse_score(row["score_pred"])
+                if h is None or a is None:
+                    continue
+                lamH = float(row["exp_goals_home"])
+                lamA = float(row["exp_goals_away"])
+                err = (h - lamH)**2 + (a - lamA)**2
+                if best_err is None or err < best_err:
+                    best_err = err
+                    best_idx = idx
+            return group.loc[best_idx] if best_idx is not None else group.iloc[0]
+
+        if not model_df.empty:
+            model_df = (
+                model_df.groupby(["date", "home_team", "away_team"], as_index=False)
+                .apply(pick_best_model_row)
+                .reset_index(drop=True)
+            )
+
+        # --- 3. ChatGPT: take last per match ---
+        if not gpt_df.empty:
+            gpt_df = (
+                gpt_df.sort_values("created_at")
+                .drop_duplicates(subset=["date", "home_team", "away_team"], keep="last")
+            )
+
+        model_df = model_df.rename(columns={"score_pred": "model_score"})
+        gpt_df["chatgpt_score"] = gpt_df["chatgpt_pred"]
+
+        gpt_df = gpt_df[["date","home_team","away_team","chatgpt_score"]]
+
+        # --- 4. Merge ---
+        merged = model_df.merge(
+            gpt_df,
+            on=["date","home_team","away_team"],
+            how="left",
         )
 
-    # --------------------------------------------------------
-    # DEDUPE CHATGPT ROWS — KEEP LAST PER MATCH
-    # --------------------------------------------------------
-    if not gpt_df.empty:
-        gpt_df = (
-            gpt_df.sort_values("created_at")
-            .drop_duplicates(subset=["date", "home_team", "away_team"], keep="last")
-            .copy()
+        if merged.empty:
+            st.info(f"No merged model/ChatGPT predictions for {date_ts.date()}.")
+            continue
+
+        # --- 5. Build display frame ---
+        display_df = merged.copy()
+
+        display_df["date"] = display_df["date"].dt.date
+        display_df["exp_goals_home"] = display_df["exp_goals_home"].round(0).astype(int)
+        display_df["exp_goals_away"] = display_df["exp_goals_away"].round(0).astype(int)
+        display_df["exp_total_goals"] = display_df["exp_total_goals"].round(0).astype(int)
+
+        display_df["H Prob"] = display_df["home_win_prob"].apply(lambda x: f"{x*100:.1f}%")
+        display_df["D Prob"] = display_df["draw_prob"].apply(lambda x: f"{x*100:.1f}%")
+        display_df["A Prob"] = display_df["away_win_prob"].apply(lambda x: f"{x*100:.1f}%")
+
+        display_df["model_winner"] = display_df["model_score"].apply(winner_from_score)
+        display_df["chatgpt_winner"] = display_df["chatgpt_score"].apply(winner_from_score)
+
+        display_df["model_winner_team"] = display_df.apply(
+            lambda r: winner_to_team(r["model_winner"], r["home_team"], r["away_team"]),
+            axis=1,
+        )
+        display_df["chatgpt_winner_team"] = display_df.apply(
+            lambda r: winner_to_team(r["chatgpt_winner"], r["home_team"], r["away_team"]),
+            axis=1,
         )
 
-    # rename & align columns
-    model_df = model_df.rename(columns={"score_pred": "model_score"})
-    gpt_df["chatgpt_score"] = gpt_df["chatgpt_pred"]
+        # --- 6. Highlighting ---
+        def highlight_row(row):
+            styles = [""] * len(row)
+            idx_model_score = row.index.get_loc("model_score")
+            idx_chat_score = row.index.get_loc("chatgpt_score")
+            idx_model_win = row.index.get_loc("model_winner_team")
+            idx_chat_win = row.index.get_loc("chatgpt_winner_team")
 
-    gpt_df = gpt_df[["date", "home_team", "away_team", "chatgpt_score"]]
+            if (
+                pd.notna(row["model_score"])
+                and pd.notna(row["chatgpt_score"])
+                and row["model_score"] == row["chatgpt_score"]
+            ):
+                styles[idx_model_score] = "background-color: yellow;"
+                styles[idx_chat_score] = "background-color: yellow;"
 
-    # --------------------------------------------------------
-    # MERGE → ONE ROW PER MATCH
-    # --------------------------------------------------------
-    merged = model_df.merge(
-        gpt_df,
-        on=["date", "home_team", "away_team"],
-        how="left",
-    )
+            if (
+                pd.notna(row["model_winner_team"])
+                and pd.notna(row["chatgpt_winner_team"])
+                and row["model_winner_team"] == row["chatgpt_winner_team"]
+            ):
+                styles[idx_model_win] = "background-color: lightgreen;"
+                styles[idx_chat_win] = "background-color: lightgreen;"
 
-    if merged.empty:
-        st.info("No merged model/ChatGPT predictions for this date.")
-        return
+            return styles
 
-    # --------------------------------------------------------
-    # BUILD DISPLAY TABLE
-    # --------------------------------------------------------
-    display_df = merged.copy()
-
-    # date only, no time
-    display_df["date"] = display_df["date"].dt.date
-
-    # round xG to whole numbers
-    display_df["exp_goals_home"] = display_df["exp_goals_home"].round(0).astype(int)
-    display_df["exp_goals_away"] = display_df["exp_goals_away"].round(0).astype(int)
-    display_df["exp_total_goals"] = display_df["exp_total_goals"].round(0).astype(int)
-
-    # probabilities as %
-    display_df["H Prob"] = display_df["home_win_prob"].apply(lambda x: f"{x*100:.1f}%")
-    display_df["D Prob"] = display_df["draw_prob"].apply(lambda x: f"{x*100:.1f}%")
-    display_df["A Prob"] = display_df["away_win_prob"].apply(lambda x: f"{x*100:.1f}%")
-
-    # winners
-    display_df["model_winner"] = display_df["model_score"].apply(winner_from_score)
-    display_df["chatgpt_winner"] = display_df["chatgpt_score"].apply(winner_from_score)
-
-    display_df["model_winner_team"] = display_df.apply(
-        lambda r: winner_to_team(r["model_winner"], r["home_team"], r["away_team"]),
-        axis=1,
-    )
-    display_df["chatgpt_winner_team"] = display_df.apply(
-        lambda r: winner_to_team(r["chatgpt_winner"], r["home_team"], r["away_team"]),
-        axis=1,
-    )
-
-    # --------------------------------------------------------
-    # HIGHLIGHTING RULES
-    # --------------------------------------------------------
-    def highlight_row(row):
-        styles = [""] * len(row)
-
-        idx_model_score = row.index.get_loc("model_score")
-        idx_chat_score = row.index.get_loc("chatgpt_score")
-        idx_model_win = row.index.get_loc("model_winner_team")
-        idx_chat_win = row.index.get_loc("chatgpt_winner_team")
-
-        # Yellow if matching score
-        if (
-            pd.notna(row["model_score"])
-            and pd.notna(row["chatgpt_score"])
-            and row["model_score"] == row["chatgpt_score"]
-        ):
-            styles[idx_model_score] = "background-color: yellow; font-weight: bold;"
-            styles[idx_chat_score] = "background-color: yellow; font-weight: bold;"
-
-        # Green if matching winner
-        if (
-            pd.notna(row["model_winner_team"])
-            and pd.notna(row["chatgpt_winner_team"])
-            and row["model_winner_team"] == row["chatgpt_winner_team"]
-        ):
-            styles[idx_model_win] = "background-color: lightgreen; font-weight: bold;"
-            styles[idx_chat_win] = "background-color: lightgreen; font-weight: bold;"
-
-        return styles
-
-    # final display columns
-    display_df = display_df[
-        [
-            "date",
-            "home_team",
-            "away_team",
-            "H Prob",
-            "D Prob",
-            "A Prob",
-            "exp_goals_home",
-            "exp_goals_away",
-            "exp_total_goals",
-            "model_score",
-            "model_winner_team",
-            "chatgpt_score",
-            "chatgpt_winner_team",
+        display_df = display_df[
+            [
+                "date",
+                "home_team",
+                "away_team",
+                "H Prob","D Prob","A Prob",
+                "exp_goals_home","exp_goals_away","exp_total_goals",
+                "model_score","model_winner_team",
+                "chatgpt_score","chatgpt_winner_team",
+            ]
         ]
-    ]
 
-    st.dataframe(display_df.style.apply(highlight_row, axis=1), use_container_width=True)
+        st.dataframe(display_df.style.apply(highlight_row, axis=1), use_container_width=True)
 
-    # --------------------------------------------------------
-    # MATCH DETAIL EXPANDERS
-    # --------------------------------------------------------
-    st.markdown("### Match Details")
+        # --- 7. Expanders per match ---
+        st.markdown("### Match Details")
 
-    for _, row in merged.iterrows():
-        label = (
-            f"{row['home_team']} vs {row['away_team']} — "
-            f"{row['home_win_prob']*100:.1f}% / "
-            f"{row['draw_prob']*100:.1f}% / "
-            f"{row['away_win_prob']*100:.1f}%"
-        )
+        for _, row in merged.iterrows():
 
-        model_winner_code = winner_from_score(row["model_score"])
-        chatgpt_winner_code = (
-            winner_from_score(row["chatgpt_score"]) if row["chatgpt_score"] else None
-        )
-
-        model_winner_team = winner_to_team(
-            model_winner_code, row["home_team"], row["away_team"]
-        )
-        chatgpt_winner_team = winner_to_team(
-            chatgpt_winner_code, row["home_team"], row["away_team"]
-        )
-
-        with st.expander(label):
-            st.write(
-                f"**Home/Draw/Away** — "
-                f"{row['home_win_prob']:.3f} / "
-                f"{row['draw_prob']:.3f} / "
-                f"{row['away_win_prob']:.3f}"
+            label = (
+                f"{row['home_team']} vs {row['away_team']} — "
+                f"{row['home_win_prob']*100:.1f}% / "
+                f"{row['draw_prob']*100:.1f}% / "
+                f"{row['away_win_prob']*100:.1f}%"
             )
-            st.write(
-                f"**Rounded xG** — "
-                f"Home: `{round(row['exp_goals_home'])}`, "
-                f"Away: `{round(row['exp_goals_away'])}`, "
-                f"Total: `{round(row['exp_total_goals'])}`"
-            )
-            st.write(f"**Model score:** `{row['model_score']}`")
-            st.write(f"**Model winner:** `{model_winner_team}`")
 
-            if row["chatgpt_score"]:
-                st.write(f"**ChatGPT score:** `{row['chatgpt_score']}`")
-                st.write(f"**ChatGPT winner:** `{chatgpt_winner_team}`")
-            else:
-                st.write("_ChatGPT did not predict a score for this match._")
+            model_winner_code = winner_from_score(row["model_score"])
+            chatgpt_winner_code = winner_from_score(row["chatgpt_score"]) if row["chatgpt_score"] else None
+
+            model_winner_team = winner_to_team(model_winner_code, row["home_team"], row["away_team"])
+            chatgpt_winner_team = winner_to_team(chatgpt_winner_code, row["home_team"], row["away_team"])
+
+            with st.expander(label):
+                st.write(
+                    f"**Home/Draw/Away** — "
+                    f"{row['home_win_prob']:.3f} / {row['draw_prob']:.3f} / {row['away_win_prob']:.3f}"
+                )
+                st.write(
+                    f"**Rounded xG** — "
+                    f"Home: `{round(row['exp_goals_home'])}`, "
+                    f"Away: `{round(row['exp_goals_away'])}`, "
+                    f"Total: `{round(row['exp_total_goals'])}`"
+                )
+                st.write(f"**Model score:** `{row['model_score']}`")
+                st.write(f"**Model winner:** `{model_winner_team}`")
+
+                if row["chatgpt_score"]:
+                    st.write(f"**ChatGPT score:** `{row['chatgpt_score']}`")
+                    st.write(f"**ChatGPT winner:** `{chatgpt_winner_team}`")
+                else:
+                    st.write("_ChatGPT did not predict a score for this match._")
