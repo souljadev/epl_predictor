@@ -104,7 +104,6 @@ def render(db_path: Path):
         st.info("No upcoming predictions found in the database.")
         return
 
-    # Get next 2 unique match dates
     upcoming_dates = (
         df_dates["date"]
         .drop_duplicates()
@@ -129,11 +128,6 @@ def render(db_path: Path):
             st.info(f"No predictions for {date_ts.date()}.")
             continue
 
-        # ----------------------------------------------------
-        # SAME logic as before — SPLIT / DEDUPE / MERGE / DISPLAY
-        # (your existing block goes here unchanged)
-        # ----------------------------------------------------
-
         # --- 1. Split model vs ChatGPT ---
         model_df = df[df["score_pred"].notna()].copy()
         gpt_df   = df[df["chatgpt_pred"].notna()].copy()
@@ -148,7 +142,7 @@ def render(db_path: Path):
                     continue
                 lamH = float(row["exp_goals_home"])
                 lamA = float(row["exp_goals_away"])
-                err = (h - lamH)**2 + (a - lamA)**2
+                err = (h - lamH) ** 2 + (a - lamA) ** 2
                 if best_err is None or err < best_err:
                     best_err = err
                     best_idx = idx
@@ -156,8 +150,9 @@ def render(db_path: Path):
 
         if not model_df.empty:
             model_df = (
-                model_df.groupby(["date", "home_team", "away_team"], as_index=False)
-                .apply(pick_best_model_row)
+                model_df
+                .groupby(["date", "home_team", "away_team"], as_index=False)
+                .apply(pick_best_model_row, include_groups=False)
                 .reset_index(drop=True)
             )
 
@@ -165,18 +160,20 @@ def render(db_path: Path):
         if not gpt_df.empty:
             gpt_df = (
                 gpt_df.sort_values("created_at")
-                .drop_duplicates(subset=["date", "home_team", "away_team"], keep="last")
+                .drop_duplicates(
+                    subset=["date", "home_team", "away_team"],
+                    keep="last"
+                )
             )
 
         model_df = model_df.rename(columns={"score_pred": "model_score"})
         gpt_df["chatgpt_score"] = gpt_df["chatgpt_pred"]
-
-        gpt_df = gpt_df[["date","home_team","away_team","chatgpt_score"]]
+        gpt_df = gpt_df[["date", "home_team", "away_team", "chatgpt_score"]]
 
         # --- 4. Merge ---
         merged = model_df.merge(
             gpt_df,
-            on=["date","home_team","away_team"],
+            on=["date", "home_team", "away_team"],
             how="left",
         )
 
@@ -200,11 +197,15 @@ def render(db_path: Path):
         display_df["chatgpt_winner"] = display_df["chatgpt_score"].apply(winner_from_score)
 
         display_df["model_winner_team"] = display_df.apply(
-            lambda r: winner_to_team(r["model_winner"], r["home_team"], r["away_team"]),
+            lambda r: winner_to_team(
+                r["model_winner"], r["home_team"], r["away_team"]
+            ),
             axis=1,
         )
         display_df["chatgpt_winner_team"] = display_df.apply(
-            lambda r: winner_to_team(r["chatgpt_winner"], r["home_team"], r["away_team"]),
+            lambda r: winner_to_team(
+                r["chatgpt_winner"], r["home_team"], r["away_team"]
+            ),
             axis=1,
         )
 
@@ -239,13 +240,14 @@ def render(db_path: Path):
                 "date",
                 "home_team",
                 "away_team",
-                "H Prob","D Prob","A Prob",
-                "exp_goals_home","exp_goals_away","exp_total_goals",
-                "model_score","model_winner_team",
-                "chatgpt_score","chatgpt_winner_team",
+                "H Prob", "D Prob", "A Prob",
+                "exp_goals_home", "exp_goals_away", "exp_total_goals",
+                "model_score", "model_winner_team",
+                "chatgpt_score", "chatgpt_winner_team",
             ]
         ]
 
-        st.dataframe(display_df.style.apply(highlight_row, axis=1), use_container_width=True)
-
-        
+        st.dataframe(
+            display_df.style.apply(highlight_row, axis=1),
+            use_container_width=True,
+        )
