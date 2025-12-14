@@ -248,40 +248,4 @@ def render(db_path: Path):
 
         st.dataframe(display_df.style.apply(highlight_row, axis=1), use_container_width=True)
 
-        # --- 7. Expanders per match ---
-        st.markdown("### Match Details")
-
-        for _, row in merged.iterrows():
-
-            label = (
-                f"{row['home_team']} vs {row['away_team']} — "
-                f"{row['home_win_prob']*100:.1f}% / "
-                f"{row['draw_prob']*100:.1f}% / "
-                f"{row['away_win_prob']*100:.1f}%"
-            )
-
-            model_winner_code = winner_from_score(row["model_score"])
-            chatgpt_winner_code = winner_from_score(row["chatgpt_score"]) if row["chatgpt_score"] else None
-
-            model_winner_team = winner_to_team(model_winner_code, row["home_team"], row["away_team"])
-            chatgpt_winner_team = winner_to_team(chatgpt_winner_code, row["home_team"], row["away_team"])
-
-            with st.expander(label):
-                st.write(
-                    f"**Home/Draw/Away** — "
-                    f"{row['home_win_prob']:.3f} / {row['draw_prob']:.3f} / {row['away_win_prob']:.3f}"
-                )
-                st.write(
-                    f"**Rounded xG** — "
-                    f"Home: `{round(row['exp_goals_home'])}`, "
-                    f"Away: `{round(row['exp_goals_away'])}`, "
-                    f"Total: `{round(row['exp_total_goals'])}`"
-                )
-                st.write(f"**Model score:** `{row['model_score']}`")
-                st.write(f"**Model winner:** `{model_winner_team}`")
-
-                if row["chatgpt_score"]:
-                    st.write(f"**ChatGPT score:** `{row['chatgpt_score']}`")
-                    st.write(f"**ChatGPT winner:** `{chatgpt_winner_team}`")
-                else:
-                    st.write("_ChatGPT did not predict a score for this match._")
+        

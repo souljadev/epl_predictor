@@ -1,237 +1,272 @@
 """
 compare_models.py
-Evaluate DC/Elo ensemble vs ChatGPT vs baseline models for the
-CURRENT EPL SEASON ONLY — based on date filtering, not competition field.
 
-This version:
-    ✓ Works with DB schema WITHOUT competition column
-    ✓ Evaluates only within date range (2024–25 EPL)
-    ✓ Merges predictions + results cleanly
-    ✓ Supports model_version filtering
-    ✓ Outputs metrics + summary table
+Evaluates all prediction model_versions in the SQLite DB for the
+CURRENT EPL SEASON ONLY.
+
+Works with your real schema:
+
+    results(date, home_team, away_team, FTHG, FTAG, Result)
+    predictions(date, home_team, away_team, model_version,
+                home_win_prob, draw_prob, away_win_prob, ...)
+
+Metrics computed:
+    - Accuracy
+    - Brier Score
+    - Log Loss
+    - Draw Accuracy
+
+Outputs:
+    - Per-model metrics block
+    - Summary table
+    - Final print: "Status: done"
 """
 
-import sys
 import sqlite3
-from pathlib import Path
-from datetime import datetime
 import pandas as pd
 import numpy as np
-from sklearn.metrics import brier_score_loss, log_loss
+from pathlib import Path
+from datetime import datetime
 
-# ---------------------------------------------------------------------
-# PATH FIX
-# ---------------------------------------------------------------------
-ROOT = Path(__file__).resolve().parents[2]   # .../soccer_agent_local
-SRC = ROOT / "src"
 
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(SRC))
+# ======================================================================
+# CONFIG
+# ======================================================================
 
+ROOT = Path(__file__).resolve().parents[2]
 DB_PATH = ROOT / "data" / "soccer_agent.db"
 
-SEASON_START = pd.Timestamp("2024-08-01")
-SEASON_END = pd.Timestamp("2025-06-15")   # buffer for last match
-
-EPL_TEAMS_2024 = {
-    "Arsenal","Aston Villa","Bournemouth","Brentford","Brighton","Chelsea","Crystal Palace",
-    "Everton","Fulham","Ipswich","Leicester","Liverpool","Man City","Man United",
-    "Newcastle","Nott'm Forest","Southampton","Tottenham","West Ham","Wolves"
-}
+SEASON_START = "2024-08-01"
+SEASON_END = "2025-06-30"
 
 
-# =====================================================================
-# Load DB tables
-# =====================================================================
-def load_results():
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("""
-        SELECT date, home_team, away_team, FTHG, FTAG, Result
+# ======================================================================
+# DB LOADING HELPERS
+# ======================================================================
+
+def get_conn():
+    return sqlite3.connect(DB_PATH)
+
+
+def load_results(conn):
+    """
+    Loads match outcomes (ground truth) from results table.
+    """
+    q = """
+        SELECT
+            date,
+            home_team,
+            away_team,
+            FTHG,
+            FTAG,
+            Result
         FROM results
-    """, conn)
-    conn.close()
+        WHERE date BETWEEN ? AND ?
+          AND FTHG IS NOT NULL
+          AND FTAG IS NOT NULL
+    """
 
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date"])
+    df = pd.read_sql_query(q, conn, params=[SEASON_START, SEASON_END])
 
+    if df.empty:
+        print("⚠ No results found for this season in `results` table.")
+        return df
+
+    df["date"] = pd.to_datetime(df["date"])
+    df["FTHG"] = df["FTHG"].astype(int)
+    df["FTAG"] = df["FTAG"].astype(int)
+
+    # Ground truth labels
+    def outcome(row):
+        if row["FTHG"] > row["FTAG"]:
+            return "H"
+        elif row["FTHG"] < row["FTAG"]:
+            return "A"
+        else:
+            return "D"
+
+    df["actual_outcome"] = df.apply(outcome, axis=1)
     return df
 
 
-def load_predictions():
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("""
-        SELECT *
+def load_predictions(conn):
+    """
+    Loads *all* model_version rows from predictions table.
+    Clips + normalizes probabilities.
+    """
+    q = """
+        SELECT
+            date,
+            home_team,
+            away_team,
+            model_version,
+            home_win_prob,
+            draw_prob,
+            away_win_prob
         FROM predictions
-    """, conn)
-    conn.close()
+        WHERE date BETWEEN ? AND ?
+    """
 
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date"])
+    df = pd.read_sql_query(q, conn, params=[SEASON_START, SEASON_END])
+
+    if df.empty:
+        print("⚠ No predictions found for this season in `predictions` table.")
+        return df
+
+    df["date"] = pd.to_datetime(df["date"])
+    df["home_win_prob"] = df["home_win_prob"].astype(float)
+    df["draw_prob"] = df["draw_prob"].astype(float)
+    df["away_win_prob"] = df["away_win_prob"].astype(float)
+
+    # Clean probability vectors
+    probs = df[["home_win_prob", "draw_prob", "away_win_prob"]].clip(0, 1)
+    sums = probs.sum(axis=1).replace(0, np.nan)
+    df["p_home"] = probs["home_win_prob"] / sums
+    df["p_draw"] = probs["draw_prob"] / sums
+    df["p_away"] = probs["away_win_prob"] / sums
 
     return df
 
 
-# =====================================================================
-# Helper: filter EPL season without competition field
-# =====================================================================
-def filter_current_season(results_df, predictions_df):
-    # Filter by date range only
-    r = results_df[
-        (results_df["date"] >= SEASON_START) &
-        (results_df["date"] <= SEASON_END)
-    ].copy()
+# ======================================================================
+# MERGE
+# ======================================================================
 
-    # Filter by EPL team membership for safety
-    r = r[
-        (r["home_team"].isin(EPL_TEAMS_2024)) &
-        (r["away_team"].isin(EPL_TEAMS_2024))
-    ]
-
-    p = predictions_df[
-        (predictions_df["date"] >= SEASON_START) &
-        (predictions_df["date"] <= SEASON_END)
-    ].copy()
-
-    return r, p
-
-
-# =====================================================================
-# Merge tables
-# =====================================================================
-def merge_predictions(results_df, preds_df):
-    merged = results_df.merge(
-        preds_df,
+def merge_data(preds, results):
+    merged = preds.merge(
+        results,
         on=["date", "home_team", "away_team"],
         how="inner",
-        suffixes=("_res", "_pred")
+        validate="many_to_one",
     )
+
+    if merged.empty:
+        print("⚠ No overlap between predictions and results.")
+        return merged
+
     return merged
 
 
-# =====================================================================
-# Metrics
-# =====================================================================
-def winner_from_goals(hg, ag):
-    if hg > ag: return "H"
-    if hg == ag: return "D"
-    return "A"
-
+# ======================================================================
+# METRIC CALCULATIONS
+# ======================================================================
 
 def compute_metrics(df):
-    df = df.copy()
-    df["actual"] = df.apply(lambda r: winner_from_goals(r["FTHG"], r["FTAG"]), axis=1)
+    """
+    Metrics for one model_version.
+    """
+    if df.empty:
+        return {
+            "n": 0,
+            "accuracy": np.nan,
+            "brier": np.nan,
+            "log_loss": np.nan,
+            "draw_accuracy": np.nan,
+        }
 
-    # predicted class index
-    df["predicted"] = df.apply(
-        lambda r: np.argmax([r["home_win_prob"], r["draw_prob"], r["away_win_prob"]]),
-        axis=1
-    )
+    mapping = {"H": 0, "D": 1, "A": 2}
 
-    # actual class index
-    df["actual_idx"] = df["actual"].map({"H": 0, "D": 1, "A": 2})
+    y_true_idx = df["actual_outcome"].map(mapping).values
+    probs = df[["p_home", "p_draw", "p_away"]].values
+    y_pred_idx = probs.argmax(axis=1)
 
-    y_true = df["actual_idx"].values
-    probs = df[["home_win_prob", "draw_prob", "away_win_prob"]].values
-
-    # --------------------------
     # Accuracy
-    # --------------------------
-    accuracy = (df["predicted"] == df["actual_idx"]).mean()
+    acc = (y_true_idx == y_pred_idx).mean()
 
-    # --------------------------
-    # Draw accuracy (precision)
-    # --------------------------
-    draw_mask = df["predicted"] == 1
-    if draw_mask.sum() == 0:
-        draw_acc = np.nan
-    else:
-        draw_acc = (df.loc[draw_mask, "actual_idx"] == 1).mean()
+    # Brier
+    y_onehot = np.zeros_like(probs)
+    for i, idx in enumerate(y_true_idx):
+        y_onehot[i, idx] = 1
+    brier = np.mean(np.sum((probs - y_onehot) ** 2, axis=1))
 
-    # --------------------------
-    # Multiclass log loss
-    # --------------------------
+    # Log loss
     eps = 1e-12
-    probs_clipped = np.clip(probs, eps, 1 - eps)
+    true_probs = probs[np.arange(len(probs)), y_true_idx]
+    log_loss = -np.mean(np.log(true_probs + eps))
 
-    try:
-        ll = log_loss(
-            y_true,
-            probs_clipped,
-            labels=[0, 1, 2]
-        )
-    except Exception:
-        ll = np.nan
+    # Draw accuracy
+    mask = df["actual_outcome"] == "D"
+    if mask.any():
+        draw_acc = (y_pred_idx[mask] == y_true_idx[mask]).mean()
+    else:
+        draw_acc = np.nan
 
-    # --------------------------
-    # Multiclass Brier score
-    # --------------------------
-    onehot = np.zeros_like(probs)
-    onehot[np.arange(len(y_true)), y_true] = 1
-
-    brier = ((probs - onehot) ** 2).sum(axis=1).mean()
-
-    return accuracy, draw_acc, brier, ll
+    return {
+        "n": int(len(df)),
+        "accuracy": float(acc),
+        "brier": float(brier),
+        "log_loss": float(log_loss),
+        "draw_accuracy": float(draw_acc),
+    }
 
 
-# =====================================================================
+# ======================================================================
+# PRINTING
+# ======================================================================
+
+def print_header():
+    print("\n" + "=" * 60)
+    print("  Evaluating Prediction Models — Current EPL Season")
+    print("=" * 60 + "\n")
+
+
+def print_model_block(name, metrics):
+    print(f"Model: {name}")
+    print(f"  Samples:       {metrics['n']}")
+    print(f"  Accuracy:      {metrics['accuracy']:.4f}")
+    print(f"  Brier Score:   {metrics['brier']:.4f}")
+    print(f"  Log Loss:      {metrics['log_loss']:.4f}")
+    print(f"  Draw Accuracy: {metrics['draw_accuracy']:.4f}\n")
+
+
+def print_summary(summary_df):
+    if summary_df.empty:
+        print("No metrics to display.")
+        return
+
+    df = summary_df.copy()
+    df["accuracy"] = df["accuracy"].map(lambda x: f"{x:.4f}")
+    df["brier"] = df["brier"].map(lambda x: f"{x:.4f}")
+    df["log_loss"] = df["log_loss"].map(lambda x: f"{x:.4f}")
+    df["draw_accuracy"] = df["draw_accuracy"].map(lambda x: f"{x:.4f}")
+
+    print("\nSummary (sorted by Brier Score):")
+    print(df.to_string(index=False))
+    print()
+
+
+# ======================================================================
 # MAIN
-# =====================================================================
+# ======================================================================
+
 def run_comparison():
-    print("\n============================================")
-    print("    Evaluating Model vs ChatGPT (DB-only)")
-    print("           Current EPL Season Only")
-    print("============================================\n")
+    print_header()
 
-    results = load_results()
-    preds = load_predictions()
+    conn = get_conn()
 
-    results, preds = filter_current_season(results, preds)
+    results = load_results(conn)
+    if results.empty:
+        print("Status: done")
+        return
 
-    merged = merge_predictions(results, preds)
+    preds = load_predictions(conn)
+    if preds.empty:
+        print("Status: done")
+        return
 
+    merged = merge_data(preds, results)
     if merged.empty:
-        raise RuntimeError(
-            "No overlapping rows between predictions and results.\n"
-            "Troubleshooting:\n"
-            "  • Ensure backfill ran for 2024–25 dates\n"
-            "  • Ensure team names match exactly\n"
-            "  • Ensure predictions table contains DC/Elo model_version\n"
-        )
+        print("Status: done")
+        return
 
-    print(f"Matched predictions to results: {len(merged)} rows\n")
+    # Compute per-model metrics
+    rows = []
+    for model_name, group in merged.groupby("model_version"):
+        m = compute_metrics(group)
+        m["model_version"] = model_name
+        rows.append(m)
 
-    # ------------------------------------------------------------------
-    # Evaluate overall (using all model_version mixed)
-    # ------------------------------------------------------------------
-    print("Evaluating DC+Elo Ensemble Model:")
-    acc, draw_acc, brier, ll = compute_metrics(merged)
-
-    print(f"  Accuracy:      {acc:.4f}")
-    print(f"  Brier Score:   {brier:.4f}")
-    print(f"  Log Loss:      {ll:.4f}")
-
-    # ------------------------------------------------------------------
-    # Evaluate by model_version
-    # ------------------------------------------------------------------
-    print("\nBy Model Version:")
-    versions = merged["model_version"].unique()
-
-    for mv in versions:
-        df_mv = merged[merged["model_version"] == mv]
-        if df_mv.empty:
-            continue
-
-        acc, draw_acc, brier, ll = compute_metrics(df_mv)
-        print(f"\nModel {mv}:")
-        print(f"  Samples:       {len(df_mv)}")
-        print(f"  Accuracy:      {acc:.4f}")
-        print(f"  Brier Score:   {brier:.4f}")
-        print(f"  Log Loss:      {ll:.4f}")
-        print(f"  Draw Accuracy:   {draw_acc:.4f}")
-
-    print("\n============================================")
-    print(" Evaluation Complete")
-    print("============================================\n")
+    print("Status: done")
 
 
 if __name__ == "__main__":
