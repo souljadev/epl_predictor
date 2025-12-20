@@ -38,6 +38,7 @@ from src.predict.chatgpt_predictions import run_chatgpt_predictions
 # Import comparison step from scripts/evaluation/*
 # ------------------------------------------------------------
 from scripts.evaluation.compare_models import run_comparison
+from scripts.ingest_results_from_score import run_results_ingest
 
 # Scripts for scrape + futures→fixtures
 SCRAPE_SCRIPT = SCRIPTS / "scrape_fbref_epl.py"
@@ -82,6 +83,14 @@ def main():
         run_script(SCRAPE_SCRIPT, "STEP 1 — Scraping FBref EPL data")
     except Exception as e:
         print(f"⚠ Scrape failed: {e}")
+
+    # 1.5) Ingest recent results (last 7 days)
+    header("STEP 1.5 — INGEST RECENT RESULTS (LAST 7 DAYS)")
+    try:
+        run_results_ingest()
+    except Exception as e:
+        print(f"⚠ Results ingest failed (best-effort): {e}")
+
 
     # 2) Convert futures → fixtures
     try:
