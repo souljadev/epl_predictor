@@ -215,7 +215,7 @@ def run_model_predictions(days_ahead: int = 7, run_id: str | None = None) -> pd.
         print("predict_fixtures returned no rows.")
         return pd.DataFrame()
 
-    model_version = f"dc_elo_ensemble_live_{datetime.utcnow().strftime('%Y%m%d')}"
+    model_version = f"dc_elo_v2_home65_k28_{datetime.utcnow().strftime('%Y%m%d')}"
 
     for _, row in preds_df.iterrows():
         date_str = pd.to_datetime(row["Date"]).strftime("%Y-%m-%d")

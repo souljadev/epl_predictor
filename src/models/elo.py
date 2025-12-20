@@ -14,8 +14,8 @@ class EloModel:
 
     def __init__(
         self,
-        k_factor: float = 18.0,
-        home_advantage: float = 55.0,
+        k_factor: float = 28.0,
+        home_advantage: float = 65.0,
         base_rating: float = 1500.0,
         draw_base: float = 0.25,
         draw_max_extra: float = 0.10,
