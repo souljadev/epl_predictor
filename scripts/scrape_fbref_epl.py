@@ -1,21 +1,10 @@
-"""
-scrape_fbref_epl.py
-Scrapes EPL Scores & Fixtures from FBref and writes them into the main DB
-via db.insert_fixtures() and db.insert_results().
-
-Fully integrated with:
-    - data/soccer_agent.db
-    - db.py UPSERT helpers
-"""
-
 import sys
-import re
-import pandas as pd
-from io import StringIO
-from pathlib import Path
-import cloudscraper
-from datetime import datetime
 import logging
+from pathlib import Path
+from datetime import datetime
+
+import pandas as pd
+import requests
 
 # ------------------------------------------------------------------
 # Ensure project root + src is importable
@@ -26,7 +15,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-# Import DB helpers (uses the correct soccer_agent.db path)
+# Import DB helpers
 from db import insert_fixtures, insert_results
 
 # ------------------------------------------------------------------
@@ -38,8 +27,29 @@ DATA.mkdir(exist_ok=True)
 LOGS = ROOT / "logs"
 LOGS.mkdir(exist_ok=True)
 
-FBREF_URL = "https://fbref.com/en/comps/9/schedule/Premier-League-Scores-and-Fixtures"
-log_file = LOGS / "fbref_scrape.log"
+log_file = LOGS / "football_data_scrape.log"
+
+# ------------------------------------------------------------------
+# football-data.co.uk EPL CSV
+# ------------------------------------------------------------------
+EPL_CSV = "https://www.football-data.co.uk/mmz4281/2425/E0.csv"
+
+# ------------------------------------------------------------------
+# TEAM NAME NORMALIZATION (CRITICAL)
+# These must match the names used by your models / ChatGPT
+# ------------------------------------------------------------------
+TEAM_FIX = {
+    "Manchester United": "Man United",
+    "Manchester City": "Man City",
+    "Newcastle United": "Newcastle",
+    "Nottingham Forest": "Nott'm Forest",
+    "Wolverhampton Wanderers": "Wolves",
+    "Tottenham Hotspur": "Tottenham",
+    "West Ham United": "West Ham",
+    "Brighton & Hove Albion": "Brighton",
+    "Sheffield United": "Sheffield Utd",
+    "Luton Town": "Luton",
+}
 
 # ------------------------------------------------------------------
 # Logging
@@ -50,192 +60,76 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
-logging.info("FBref scraper started")
-
-
-# ------------------------------------------------------------------
-# Extract all tables, including commented ones
-# ------------------------------------------------------------------
-def extract_all_tables(html: str):
-    dfs = []
-
-    # FBref hides the real tables inside HTML comments
-    commented = re.findall(r"<!--(.*?)-->", html, flags=re.DOTALL)
-    for block in commented:
-        try:
-            dfs.extend(pd.read_html(StringIO(block), flavor="lxml"))
-        except Exception:
-            pass
-
-    # Also try visible tables
-    try:
-        dfs.extend(pd.read_html(StringIO(html), flavor="lxml"))
-    except Exception:
-        pass
-
-    return dfs
-
-
-# ------------------------------------------------------------------
-# Identify fixture table
-# ------------------------------------------------------------------
-def find_fixture_table(tables):
-    required_cols = {"Date", "Home", "Away"}
-
-    for t in tables:
-        if required_cols.issubset(t.columns):
-            return t
-
-    logging.error("FBref fixtures table not found — HTML structure changed.")
-    raise ValueError("❌ Could not locate Fixtures table on FBref")
-
-
-# ------------------------------------------------------------------
-# Date parsing
-# ------------------------------------------------------------------
-def parse_date(x):
-    try:
-        return datetime.strptime(x, "%Y-%m-%d")
-    except Exception:
-        return None
-
+logging.info("football-data EPL scraper started")
 
 # ------------------------------------------------------------------
 # UPSERT into main DB
 # ------------------------------------------------------------------
 def upsert_to_main_db(df: pd.DataFrame):
-    """
-    Convert FBref format → db.py-friendly DataFrame:
-        Date, HomeTeam, AwayTeam, FTHG, FTAG
-    Then pass to:
-        insert_fixtures()
-        insert_results()
-    which perform correct UPSERTs in soccer_agent.db.
-    """
-
     df_epl = pd.DataFrame(
         {
-            "Date": df["match_date"],
-            "HomeTeam": df["home_team"],
-            "AwayTeam": df["away_team"],
-            "FTHG": df["home_goals"],
-            "FTAG": df["away_goals"],
+            "Date": df["Date"],
+            "HomeTeam": df["HomeTeam"],
+            "AwayTeam": df["AwayTeam"],
+            "FTHG": df["FTHG"],
+            "FTAG": df["FTAG"],
         }
     )
 
-    # Insert fixtures (future + past)
     insert_fixtures(df_epl)
-
-    # Insert results (only rows with scores)
     insert_results(df_epl)
 
     return len(df_epl)
 
-
 # ------------------------------------------------------------------
 # Main scrape function
 # ------------------------------------------------------------------
-def scrape_fbref():
-    print("Scraping FBref EPL fixtures…")
+def scrape_football_data():
+    print("Scraping EPL data from football-data.co.uk…")
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "DNT": "1",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-User": "?1",
-        "Sec-Fetch-Dest": "document",
-    }
+    try:
+        df = pd.read_csv(EPL_CSV)
+    except Exception as e:
+        logging.error(f"Failed to download football-data CSV: {e}")
+        raise RuntimeError("❌ Could not download football-data CSV")
 
-    scraper = cloudscraper.create_scraper()
-    response = scraper.get(FBREF_URL, headers=headers)
-    html = response.text
+    required = {"Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"}
+    if not required.issubset(df.columns):
+        raise RuntimeError(f"❌ Unexpected CSV structure: {df.columns}")
 
-    # --------------------------------------------------------------
-    # Blocked detection
-    # --------------------------------------------------------------
-    if "<table" not in html and "<!--" not in html:
-        print("❌ Blocked by FBref / Cloudflare")
-        debug_path = ROOT / "blocked_fbref.html"
-        debug_path.write_text(html, encoding="utf-8")
-        logging.error("FBref BLOCKED — saved blocked HTML.")
-        raise RuntimeError("FBref returned no table content — likely bot protection")
+    # ------------------------------------------------------------------
+    # Normalize dates (DD/MM/YYYY)
+    # ------------------------------------------------------------------
+    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+    df = df[df["Date"].notna()].reset_index(drop=True)
 
-    # --------------------------------------------------------------
-    # Extract all tables
-    # --------------------------------------------------------------
-    tables = extract_all_tables(html)
-    if not tables:
-        logging.error("No tables extracted — layout changed?")
-        raise RuntimeError("❌ No tables extracted from FBref")
+    # ------------------------------------------------------------------
+    # NORMALIZE TEAM NAMES (THIS FIXES CHATGPT BLANK ISSUE)
+    # ------------------------------------------------------------------
+    df["HomeTeam"] = df["HomeTeam"].replace(TEAM_FIX)
+    df["AwayTeam"] = df["AwayTeam"].replace(TEAM_FIX)
 
-    fixtures = find_fixture_table(tables).copy()
+    # ------------------------------------------------------------------
+    # Save CSV snapshot for debugging
+    # ------------------------------------------------------------------
+    csv_path = DATA / "fixtures_football_data.csv"
+    df.to_csv(csv_path, index=False)
 
-    # Remove duplicated header rows
-    fixtures = fixtures[fixtures["Date"] != "Date"]
-
-    # Warn if FBref changes structure
-    expected = {"Date", "Home", "Away", "Score"}
-    actual = set(fixtures.columns)
-    if not expected.issubset(actual):
-        logging.warning(f"Unexpected FBref column structure: {actual}")
-
-    # --------------------------------------------------------------
-    # Parse dates & scores
-    # --------------------------------------------------------------
-    fixtures["match_date"] = fixtures["Date"].astype(str).apply(parse_date)
-
-    def split_score(x):
-        if isinstance(x, str) and "-" in x:
-            h, a = x.split("-")
-            try:
-                return int(h), int(a)
-            except ValueError:
-                return None, None
-        return None, None
-
-    fixtures["home_goals"], fixtures["away_goals"] = zip(*fixtures["Score"].apply(split_score))
-
-    out = fixtures[
-        ["match_date", "Home", "Away", "home_goals", "away_goals", "Score"]
-    ].rename(
-        columns={
-            "Home": "home_team",
-            "Away": "away_team",
-            "Score": "score",
-        }
-    )
-
-    out = out[out["match_date"].notnull()].reset_index(drop=True)
-    out = out.sort_values("match_date")
-
-    # Save CSV for debugging
-    csv_path = DATA / "fixtures_fbref.csv"
-    out.to_csv(csv_path, index=False)
     print(f"📄 Saved CSV → {csv_path}")
-    print(f"🔢 Rows scraped: {len(out)}")
+    print(f"🔢 Rows scraped: {len(df)}")
 
-    # --------------------------------------------------------------
-    # UPSERT into main DB
-    # --------------------------------------------------------------
-    inserted = upsert_to_main_db(out)
+    # ------------------------------------------------------------------
+    # UPSERT into DB
+    # ------------------------------------------------------------------
+    inserted = upsert_to_main_db(df)
 
-    print(f"✅ Upserted {inserted} rows into data/soccer_agent.db")
-    logging.info(f"Upserted {inserted} fixture/results rows")
+    print(f"✅ Upserted {inserted} rows into soccer_agent.db")
+    logging.info(f"Upserted {inserted} rows")
 
-    print("\n✔ Scrape complete.")
-    print(f"📌 Log written to: {log_file}")
-
+    print("✔ Scrape complete.")
 
 # ------------------------------------------------------------------
-# Entry point
+# Entry
 # ------------------------------------------------------------------
 if __name__ == "__main__":
-    scrape_fbref()
+    scrape_football_data()
