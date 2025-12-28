@@ -119,7 +119,12 @@ def render(db_path: Path):
     model_df = model_df.rename(columns={"score_pred": "model_score"})
     gpt_df   = gpt_df.rename(columns={"chatgpt_pred": "chatgpt_score"})
 
-    gpt_df = gpt_df[["date","home_team","away_team","chatgpt_score"]]
+    gpt_df = (
+        gpt_df[["date","home_team","away_team","chatgpt_score"]]
+        .sort_values("date")
+        .groupby(["date","home_team","away_team"], as_index=False)
+        .last()
+    )
 
     # --------------------------------------------------------
     # DEDUPE MODEL VERSIONS
@@ -135,6 +140,12 @@ def render(db_path: Path):
         .apply(pick_best_model_row, include_groups=False)
         .reset_index(drop=True)
     )
+    
+    results = results.drop_duplicates(
+    subset=["date","home_team","away_team"],
+    keep="last"
+)
+
 
     # --------------------------------------------------------
     # MERGE

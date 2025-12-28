@@ -34,10 +34,6 @@ def winner_to_team(label, home, away):
 
 
 def parse_score(score):
-    """
-    '2-1' -> (2,1)
-    returns (None, None) if bad.
-    """
     try:
         h, a = map(int, str(score).split("-"))
         return h, a
@@ -67,7 +63,7 @@ def load_predictions_for_date(db_path: Path, target_date: pd.Timestamp) -> pd.Da
             chatgpt_pred,
             created_at
         FROM predictions
-        WHERE date = ?
+        WHERE DATE(date) = ?
         ORDER BY home_team, away_team, created_at
         """,
         conn,
@@ -86,22 +82,22 @@ def render(db_path: Path):
     st.subheader("Upcoming Predictions (Next 2 Matchdays)")
 
     # --------------------------------------------------------
-    # Find next 2 matchdays with predictions available
+    # Get upcoming matchdays from FIXTURES (not predictions)
     # --------------------------------------------------------
     conn = sqlite3.connect(db_path)
     df_dates = pd.read_sql_query(
         """
-        SELECT DISTINCT date 
-        FROM predictions
-        WHERE date >= DATE('now')
-        ORDER BY date ASC
+        SELECT DISTINCT Date AS date
+        FROM fixtures
+        WHERE Date >= DATE('now')
+        ORDER BY Date ASC
         """,
         conn,
     )
     conn.close()
 
     if df_dates.empty:
-        st.info("No upcoming predictions found in the database.")
+        st.info("No upcoming fixtures found.")
         return
 
     upcoming_dates = (
@@ -119,7 +115,6 @@ def render(db_path: Path):
     # --------------------------------------------------------
     for d in upcoming_dates:
         date_ts = pd.to_datetime(d)
-
         st.markdown(f"## Matchday — {date_ts.date()}")
 
         df = load_predictions_for_date(db_path, date_ts)
@@ -130,7 +125,7 @@ def render(db_path: Path):
 
         # --- 1. Split model vs ChatGPT ---
         model_df = df[df["score_pred"].notna()].copy()
-        gpt_df   = df[df["chatgpt_pred"].notna()].copy()
+        gpt_df = df[df["chatgpt_pred"].notna()].copy()
 
         # --- 2. Smart dedupe model versions ---
         def pick_best_model_row(group: pd.DataFrame) -> pd.Series:
@@ -156,7 +151,7 @@ def render(db_path: Path):
                 .reset_index(drop=True)
             )
 
-        # --- 3. ChatGPT: take last per match ---
+        # --- 3. ChatGPT: take most recent per match ---
         if not gpt_df.empty:
             gpt_df = (
                 gpt_df.sort_values("created_at")
@@ -178,13 +173,13 @@ def render(db_path: Path):
         )
 
         if merged.empty:
-            st.info(f"No merged model/ChatGPT predictions for {date_ts.date()}.")
+            st.info(f"No merged predictions for {date_ts.date()}.")
             continue
 
         # --- 5. Build display frame ---
         display_df = merged.copy()
-
         display_df["date"] = display_df["date"].dt.date
+
         display_df["exp_goals_home"] = display_df["exp_goals_home"].round(0).astype(int)
         display_df["exp_goals_away"] = display_df["exp_goals_away"].round(0).astype(int)
         display_df["exp_total_goals"] = display_df["exp_total_goals"].round(0).astype(int)
