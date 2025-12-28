@@ -30,13 +30,13 @@ LOGS.mkdir(exist_ok=True)
 log_file = LOGS / "football_data_scrape.log"
 
 # ------------------------------------------------------------------
-# football-data.co.uk EPL CSV
+# football-data.co.uk EPL CSV (2025–26)
 # ------------------------------------------------------------------
-EPL_CSV = "https://www.football-data.co.uk/mmz4281/2425/E0.csv"
+EPL_CSV = "https://www.football-data.co.uk/mmz4281/2526/E0.csv"
 
 # ------------------------------------------------------------------
-# TEAM NAME NORMALIZATION (CRITICAL)
-# These must match the names used by your models / ChatGPT
+# TEAM NAME NORMALIZATION (AUTHORITATIVE)
+# These MUST match names used by models / ChatGPT / dashboards
 # ------------------------------------------------------------------
 TEAM_FIX = {
     "Manchester United": "Man United",
@@ -51,6 +51,13 @@ TEAM_FIX = {
     "Luton Town": "Luton",
 }
 
+EPL_TEAMS_2024 = {
+    "Arsenal", "Aston Villa", "Bournemouth", "Brentford", "Brighton",
+    "Chelsea", "Crystal Palace", "Everton", "Fulham", "Ipswich",
+    "Leicester", "Liverpool", "Man City", "Man United", "Newcastle",
+    "Nott'm Forest", "Southampton", "Tottenham", "West Ham", "Wolves",
+}
+
 # ------------------------------------------------------------------
 # Logging
 # ------------------------------------------------------------------
@@ -63,9 +70,13 @@ logging.basicConfig(
 logging.info("football-data EPL scraper started")
 
 # ------------------------------------------------------------------
-# UPSERT into main DB
+# UPSERT helpers
 # ------------------------------------------------------------------
-def upsert_to_main_db(df: pd.DataFrame):
+def upsert_to_main_db(df: pd.DataFrame) -> int:
+    """
+    Upserts fixtures (all matches) and results (only played matches).
+    Returns number of rows processed (not necessarily newly inserted).
+    """
     df_epl = pd.DataFrame(
         {
             "Date": df["Date"],
@@ -76,8 +87,12 @@ def upsert_to_main_db(df: pd.DataFrame):
         }
     )
 
+    # Fixtures: include future matches
     insert_fixtures(df_epl)
-    insert_results(df_epl)
+
+    # Results: only completed matches
+    results_df = df_epl.dropna(subset=["FTHG", "FTAG"])
+    insert_results(results_df)
 
     return len(df_epl)
 
@@ -104,10 +119,18 @@ def scrape_football_data():
     df = df[df["Date"].notna()].reset_index(drop=True)
 
     # ------------------------------------------------------------------
-    # NORMALIZE TEAM NAMES (THIS FIXES CHATGPT BLANK ISSUE)
+    # Normalize team names (CRITICAL)
     # ------------------------------------------------------------------
     df["HomeTeam"] = df["HomeTeam"].replace(TEAM_FIX)
     df["AwayTeam"] = df["AwayTeam"].replace(TEAM_FIX)
+
+    # ------------------------------------------------------------------
+    # Sanity check: unknown teams
+    # ------------------------------------------------------------------
+    all_teams = set(df["HomeTeam"]) | set(df["AwayTeam"])
+    unknown = all_teams - EPL_TEAMS_2024
+    if unknown:
+        logging.warning(f"Unknown teams detected: {sorted(unknown)}")
 
     # ------------------------------------------------------------------
     # Save CSV snapshot for debugging
@@ -121,10 +144,10 @@ def scrape_football_data():
     # ------------------------------------------------------------------
     # UPSERT into DB
     # ------------------------------------------------------------------
-    inserted = upsert_to_main_db(df)
+    processed = upsert_to_main_db(df)
 
-    print(f"✅ Upserted {inserted} rows into soccer_agent.db")
-    logging.info(f"Upserted {inserted} rows")
+    print(f"✅ Processed {processed} rows (upsert attempted)")
+    logging.info(f"Processed {processed} rows")
 
     print("✔ Scrape complete.")
 
