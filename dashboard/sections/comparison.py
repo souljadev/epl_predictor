@@ -99,6 +99,14 @@ def winner_from_score(score):
         return None
 
 
+def accuracy_pct(series: pd.Series):
+    valid = series.dropna()
+    if valid.empty:
+        return np.nan
+    return 100 * valid.mean()
+
+
+
 # ------------------------------------------------------------
 # RENDER
 # ------------------------------------------------------------
@@ -183,13 +191,26 @@ def render(db_path: Path):
     merged = (
         model_df
         .merge(gpt_df, on=["date","home_team","away_team"], how="left")
-        .merge(gemini_df[["date","home_team","away_team","gemini_score"]],
-               on=["date","home_team","away_team"], how="left")
-        .merge(results[["date","home_team","away_team","FTHG","FTAG"]],
-               on=["date","home_team","away_team"], how="left")
+        .merge(
+            gemini_df[["date","home_team","away_team","gemini_score"]],
+            on=["date","home_team","away_team"],
+            how="left",
+        )
+        .merge(
+            results[["date","home_team","away_team","FTHG","FTAG"]],
+            on=["date","home_team","away_team"],
+            how="left",
+        )
     )
 
     merged = merged.dropna(subset=["FTHG", "FTAG"])
+    # --------------------------------------------------------
+    # PREDICTION MADE FLAGS (ISOLATED, REUSABLE)
+    # --------------------------------------------------------
+    model_pred_made  = merged["model_score"].notna()
+    gpt_pred_made    = merged["chatgpt_score"].notna()
+    gemini_pred_made = merged["gemini_score"].notna()
+
 
     # --------------------------------------------------------
     # WINNERS + SCORES
@@ -231,7 +252,6 @@ def render(db_path: Path):
         )
     )
 
-
     # --------------------------------------------------------
     # CORRECTNESS
     # --------------------------------------------------------
@@ -239,12 +259,57 @@ def render(db_path: Path):
     merged["gpt_correct"]    = merged["gpt_winner_team"]    == merged["actual_winner"]
     merged["gemini_correct"] = merged["gemini_winner_team"] == merged["actual_winner"]
 
-    merged["model_score_correct"]  = merged["model_score"]  == merged["actual_score"]
+    merged["model_score_correct"]  = merged["model_score"]   == merged["actual_score"]
     merged["gpt_score_correct"]    = merged["chatgpt_score"] == merged["actual_score"]
     merged["gemini_score_correct"] = merged["gemini_score"]  == merged["actual_score"]
 
     # --------------------------------------------------------
-    # FINAL DISPLAY
+    # DRAW ACCURACY MASKS (ISOLATED)
+    # --------------------------------------------------------
+    actual_draw = merged["actual_winner"] == "Draw"
+
+    model_pred_draw  = merged["model_winner_team"]  == "Draw"
+    gpt_pred_draw    = merged["gpt_winner_team"]    == "Draw"
+    gemini_pred_draw = merged["gemini_winner_team"] == "Draw"
+
+    def draw_accuracy(pred_draw, pred_made):
+        mask = actual_draw & pred_made
+        if mask.sum() == 0:
+            return np.nan
+        return 100 * (pred_draw & actual_draw & pred_made).sum() / mask.sum()
+
+    # --------------------------------------------------------
+    # ADDITIVE: ACCURACY SUMMARY (NEW)
+    # --------------------------------------------------------
+    accuracy_df = pd.DataFrame({
+        "Source": ["Model", "ChatGPT", "Gemini"],
+        "Winner Accuracy (%)": [
+            accuracy_pct(merged["model_correct"]),
+            accuracy_pct(merged["gpt_correct"]),
+            accuracy_pct(merged["gemini_correct"]),
+        ],
+        "Exact Score Accuracy (%)": [
+            accuracy_pct(merged["model_score_correct"]),
+            accuracy_pct(merged["gpt_score_correct"]),
+            accuracy_pct(merged["gemini_score_correct"]),
+        ],
+        "Draw Accuracy (%)": [
+            draw_accuracy(model_pred_draw,  model_pred_made),
+            draw_accuracy(gpt_pred_draw,    gpt_pred_made),
+            draw_accuracy(gemini_pred_draw, gemini_pred_made),
+        ],
+        "Predictions Made": [
+            model_pred_made.sum(),
+            gpt_pred_made.sum(),
+            gemini_pred_made.sum(),
+        ],
+    })
+
+    st.markdown("### Accuracy Summary (Past 30 Days)")
+    st.dataframe(accuracy_df.round(2), use_container_width=True)
+
+    # --------------------------------------------------------
+    # FINAL DISPLAY (UNCHANGED)
     # --------------------------------------------------------
     merged["date"] = merged["date"].dt.date
     merged = merged.sort_values("date", ascending=False)

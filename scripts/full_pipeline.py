@@ -8,7 +8,8 @@ Workflow:
   4) Ingest + retrain structural models
   5) Generate model predictions
   6) Generate ChatGPT predictions
-  7) Compare model vs ChatGPT
+  6.5) Generate Gemini predictions
+  7) Compare model vs ChatGPT vs Gemini
 """
 
 import sys
@@ -22,7 +23,6 @@ from datetime import datetime, timezone
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = PROJECT_ROOT / "scripts"
 
-# Add project root so `src` and `scripts` are importable
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -33,15 +33,15 @@ from src.agent.auto_tuner_structural import run_auto_tuner
 from src.agent.ingest_and_retrain import run_structural_tuning
 from src.predict.predict_model import run_model_predictions
 from src.predict.chatgpt_predictions import run_chatgpt_predictions
+from src.predict.gemini.gemini_prediction import run_gemini_predictions
 
 # ------------------------------------------------------------
-# Import comparison step from scripts/evaluation/*
+# Import comparison + results ingest
 # ------------------------------------------------------------
 from scripts.evaluation.compare_models import run_comparison
 from scripts.ingest_results_from_score import run_results_ingest
 
-# Scripts for scrape + futures→fixtures
-SCRAPE_SCRIPT = SCRIPTS / "scrape_fbref_epl.py"
+SCRAPE_SCRIPT  = SCRIPTS / "scrape_fbref_epl.py"
 CONVERT_SCRIPT = SCRIPTS / "convert_futures_to_fixtures.py"
 
 
@@ -84,13 +84,12 @@ def main():
     except Exception as e:
         print(f"⚠ Scrape failed: {e}")
 
-    # 1.5) Ingest recent results (last 7 days)
+    # 1.5) Ingest recent results
     header("STEP 1.5 — INGEST RECENT RESULTS (LAST 7 DAYS)")
     try:
         run_results_ingest()
     except Exception as e:
         print(f"⚠ Results ingest failed (best-effort): {e}")
-
 
     # 2) Convert futures → fixtures
     try:
@@ -105,7 +104,7 @@ def main():
     except Exception as e:
         print("⚠ Auto-tuner failed:", e)
 
-    # 4) Ingest new data + retrain
+    # 4) Ingest + retrain
     header("STEP 4 — INGEST + RETRAIN STRUCTURAL MODELS")
     try:
         run_structural_tuning()
@@ -126,8 +125,15 @@ def main():
     except Exception as e:
         print("⚠ ChatGPT predictions failed:", e)
 
+    # 6.5) Gemini predictions
+    header("STEP 6.5 — GEMINI SCORE PREDICTIONS")
+    try:
+        run_gemini_predictions()
+    except Exception as e:
+        print("⚠ Gemini predictions failed:", e)
+
     # 7) Comparison
-    header("STEP 7 — MODEL vs CHATGPT COMPARISON")
+    header("STEP 7 — MODEL vs CHATGPT vs GEMINI COMPARISON")
     try:
         run_comparison()
     except Exception as e:
