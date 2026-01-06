@@ -64,6 +64,26 @@ def load_predictions(db_path: Path) -> pd.DataFrame:
     return df.dropna(subset=["date"])
 
 
+def load_gemini_predictions(db_path: Path) -> pd.DataFrame:
+    conn = sqlite3.connect(db_path)
+    df = pd.read_sql_query(
+        """
+        SELECT
+            match_date AS date,
+            home_team,
+            away_team,
+            predicted_score AS gemini_score,
+            created_at
+        FROM gemini_predictions
+        """,
+        conn,
+    )
+    conn.close()
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    return df.dropna(subset=["date"])
+
+
 # ------------------------------------------------------------
 # HELPERS
 # ------------------------------------------------------------
@@ -83,16 +103,17 @@ def winner_from_score(score):
 # RENDER
 # ------------------------------------------------------------
 def render(db_path: Path):
-    st.subheader("Model vs ChatGPT vs Actual — Past 30 Days")
+    st.subheader("Model vs ChatGPT vs Gemini vs Actual — Past 30 Days")
 
     today = pd.Timestamp.today().normalize()
     window_start = today - pd.Timedelta(days=30)
 
     preds = load_predictions(db_path)
     results = load_results(db_path)
+    gemini = load_gemini_predictions(db_path)
 
     # Normalize team names
-    for df in (preds, results):
+    for df in (preds, results, gemini):
         df["home_team"] = df["home_team"].replace(TEAM_FIX)
         df["away_team"] = df["away_team"].replace(TEAM_FIX)
 
@@ -103,8 +124,9 @@ def render(db_path: Path):
     ]
 
     # Date filter
-    preds = preds[preds["date"].between(window_start, today)]
+    preds   = preds[preds["date"].between(window_start, today)]
     results = results[results["date"].between(window_start, today)]
+    gemini  = gemini[gemini["date"].between(window_start, today)]
 
     if preds.empty:
         st.info("No EPL matches found in the past 30 days.")
@@ -127,6 +149,15 @@ def render(db_path: Path):
     )
 
     # --------------------------------------------------------
+    # GEMINI (LATEST PER MATCH)
+    # --------------------------------------------------------
+    gemini_df = (
+        gemini.sort_values("created_at")
+        .groupby(["date","home_team","away_team"], as_index=False)
+        .last()
+    )
+
+    # --------------------------------------------------------
     # DEDUPE MODEL VERSIONS
     # --------------------------------------------------------
     def pick_best_model_row(group: pd.DataFrame) -> pd.Series:
@@ -140,31 +171,24 @@ def render(db_path: Path):
         .apply(pick_best_model_row, include_groups=False)
         .reset_index(drop=True)
     )
-    
-    results = results.drop_duplicates(
-    subset=["date","home_team","away_team"],
-    keep="last"
-)
 
+    results = results.drop_duplicates(
+        subset=["date","home_team","away_team"],
+        keep="last"
+    )
 
     # --------------------------------------------------------
     # MERGE
     # --------------------------------------------------------
     merged = (
-        model_df.merge(
-            gpt_df,
-            on=["date","home_team","away_team"],
-            how="left",
-        )
-        .merge(
-            results[["date","home_team","away_team","FTHG","FTAG"]],
-            on=["date","home_team","away_team"],
-            how="left",
-        )
+        model_df
+        .merge(gpt_df, on=["date","home_team","away_team"], how="left")
+        .merge(gemini_df[["date","home_team","away_team","gemini_score"]],
+               on=["date","home_team","away_team"], how="left")
+        .merge(results[["date","home_team","away_team","FTHG","FTAG"]],
+               on=["date","home_team","away_team"], how="left")
     )
-    # --------------------------------------------------------
-    # DROP MATCHES WITHOUT ACTUAL RESULTS
-    # --------------------------------------------------------
+
     merged = merged.dropna(subset=["FTHG", "FTAG"])
 
     # --------------------------------------------------------
@@ -174,24 +198,19 @@ def render(db_path: Path):
         arr = [row["home_win_prob"], row["draw_prob"], row["away_win_prob"]]
         return {0:"H",1:"D",2:"A"}[int(np.argmax(arr))]
 
-    merged["model_winner"] = merged.apply(winner_from_probs, axis=1)
-    merged["gpt_winner"]   = merged["chatgpt_score"].apply(winner_from_score)
-
-    merged["FTHG"] = pd.to_numeric(merged["FTHG"], errors="coerce")
-    merged["FTAG"] = pd.to_numeric(merged["FTAG"], errors="coerce")
+    merged["model_winner"]  = merged.apply(winner_from_probs, axis=1)
+    merged["gpt_winner"]    = merged["chatgpt_score"].apply(winner_from_score)
+    merged["gemini_winner"] = merged["gemini_score"].apply(winner_from_score)
 
     merged["actual_score"] = (
-        merged["FTHG"].astype("Int64").astype(str)
+        merged["FTHG"].astype(int).astype(str)
         + "-"
-        + merged["FTAG"].astype("Int64").astype(str)
+        + merged["FTAG"].astype(int).astype(str)
     )
 
     merged["actual_winner"] = np.where(
         merged["FTHG"] > merged["FTAG"], merged["home_team"],
-        np.where(
-            merged["FTHG"] < merged["FTAG"], merged["away_team"],
-            "Draw"
-        )
+        np.where(merged["FTHG"] < merged["FTAG"], merged["away_team"], "Draw")
     )
 
     merged["model_winner_team"] = np.where(
@@ -204,12 +223,25 @@ def render(db_path: Path):
         np.where(merged["gpt_winner"] == "A", merged["away_team"], "Draw")
     )
 
-    # Correctness
-    merged["model_correct"] = merged["model_winner_team"] == merged["actual_winner"]
-    merged["gpt_correct"]   = merged["gpt_winner_team"] == merged["actual_winner"]
+    merged["gemini_winner_team"] = np.where(
+        merged["gemini_winner"] == "H", merged["home_team"],
+        np.where(
+            merged["gemini_winner"] == "A", merged["away_team"],
+            np.where(merged["gemini_winner"] == "D", "Draw", np.nan)
+        )
+    )
 
-    merged["model_score_correct"] = merged["model_score"] == merged["actual_score"]
-    merged["gpt_score_correct"]   = merged["chatgpt_score"] == merged["actual_score"]
+
+    # --------------------------------------------------------
+    # CORRECTNESS
+    # --------------------------------------------------------
+    merged["model_correct"]  = merged["model_winner_team"]  == merged["actual_winner"]
+    merged["gpt_correct"]    = merged["gpt_winner_team"]    == merged["actual_winner"]
+    merged["gemini_correct"] = merged["gemini_winner_team"] == merged["actual_winner"]
+
+    merged["model_score_correct"]  = merged["model_score"]  == merged["actual_score"]
+    merged["gpt_score_correct"]    = merged["chatgpt_score"] == merged["actual_score"]
+    merged["gemini_score_correct"] = merged["gemini_score"]  == merged["actual_score"]
 
     # --------------------------------------------------------
     # FINAL DISPLAY
@@ -232,6 +264,10 @@ def render(db_path: Path):
             "gpt_winner_team",
             "gpt_correct",
             "gpt_score_correct",
+            "gemini_score",
+            "gemini_winner_team",
+            "gemini_correct",
+            "gemini_score_correct",
         ]
     ]
 
@@ -248,8 +284,10 @@ def render(db_path: Path):
             subset=[
                 "model_correct",
                 "gpt_correct",
+                "gemini_correct",
                 "model_score_correct",
                 "gpt_score_correct",
+                "gemini_score_correct",
             ],
         ),
         use_container_width=True,
