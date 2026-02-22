@@ -280,21 +280,60 @@ def render(db_path: Path):
         # -------------------------
         def highlight_row(row):
             styles = [""] * len(row)
-
             cols = row.index.tolist()
-            i = lambda c: cols.index(c)
+            idx = lambda c: cols.index(c)
 
-            if row["model_score"] == row["chatgpt_score"]:
-                styles[i("model_score")] = styles[i("chatgpt_score")] = "background-color:#ffe599;"
+            # ---------- COLORS ----------
+            BRIGHT_GREEN = "background-color:#66df31; color:white;"   # all 3 match
+            LIGHT_GREEN  = "background-color:#b6d7a8;"                # model + one
+            BLUE_MATCH   = "background-color:#cfe2f3;"                # gpt + gemini only
 
-            if row["model_score"] == row["gemini_score"]:
-                styles[i("model_score")] = styles[i("gemini_score")] = "background-color:#ffe599;"
+            # ---------- SCORE MATCHING ----------
+            model_s  = row["model_score"]
+            gpt_s    = row["chatgpt_score"]
+            gem_s    = row["gemini_score"]
 
-            if row["model_winner_team"] == row["chatgpt_winner_team"]:
-                styles[i("model_winner_team")] = styles[i("chatgpt_winner_team")] = "background-color:#d9ead3;"
+            score_matches = {
+                "model_gpt": model_s == gpt_s and pd.notna(model_s),
+                "model_gem": model_s == gem_s and pd.notna(model_s),
+                "gpt_gem":   gpt_s == gem_s and pd.notna(gpt_s),
+            }
 
-            if row["model_winner_team"] == row["gemini_winner_team"]:
-                styles[i("model_winner_team")] = styles[i("gemini_winner_team")] = "background-color:#d9ead3;"
+            if score_matches["model_gpt"] and score_matches["model_gem"]:
+                # all 3
+                for c in ["model_score", "chatgpt_score", "gemini_score"]:
+                    styles[idx(c)] = BRIGHT_GREEN
+            elif score_matches["model_gpt"] or score_matches["model_gem"]:
+                # model + one
+                for c in ["model_score", "chatgpt_score", "gemini_score"]:
+                    if row[c] == model_s:
+                        styles[idx(c)] = LIGHT_GREEN
+            elif score_matches["gpt_gem"]:
+                # gpt + gemini only
+                styles[idx("chatgpt_score")] = BLUE_MATCH
+                styles[idx("gemini_score")]  = BLUE_MATCH
+
+            # ---------- WINNER MATCHING ----------
+            model_w = row["model_winner_team"]
+            gpt_w   = row["chatgpt_winner_team"]
+            gem_w   = row["gemini_winner_team"]
+
+            winner_matches = {
+                "model_gpt": model_w == gpt_w and pd.notna(model_w),
+                "model_gem": model_w == gem_w and pd.notna(model_w),
+                "gpt_gem":   gpt_w == gem_w and pd.notna(gpt_w),
+            }
+
+            if winner_matches["model_gpt"] and winner_matches["model_gem"]:
+                for c in ["model_winner_team", "chatgpt_winner_team", "gemini_winner_team"]:
+                    styles[idx(c)] = BRIGHT_GREEN
+            elif winner_matches["model_gpt"] or winner_matches["model_gem"]:
+                for c in ["model_winner_team", "chatgpt_winner_team", "gemini_winner_team"]:
+                    if row[c] == model_w:
+                        styles[idx(c)] = LIGHT_GREEN
+            elif winner_matches["gpt_gem"]:
+                styles[idx("chatgpt_winner_team")] = BLUE_MATCH
+                styles[idx("gemini_winner_team")]  = BLUE_MATCH
 
             return styles
 
