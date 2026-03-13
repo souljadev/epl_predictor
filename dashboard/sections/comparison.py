@@ -15,9 +15,14 @@ EPL_TEAMS_2024 = {
 }
 
 TEAM_FIX = {
+    # Manchester United aliases
     "Manchester United": "Man United",
     "Man Utd": "Man United",
     "Manchester Utd": "Man United",
+    # Manchester City aliases
+    "Manchester City": "Man City",
+    "Man City": "Man City",
+    # Nottingham Forest aliases
     "Nott'ham Forest": "Nott'm Forest",
     "Nottingham Forest": "Nott'm Forest",
 }
