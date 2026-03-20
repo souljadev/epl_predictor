@@ -15,9 +15,14 @@ EPL_TEAMS_2024 = {
 }
 
 TEAM_FIX = {
+    # Manchester United aliases
     "Manchester United": "Man United",
     "Man Utd": "Man United",
     "Manchester Utd": "Man United",
+    # Manchester City aliases
+    "Manchester City": "Man City",
+    "Man City": "Man City",
+    # Nottingham Forest aliases
     "Nott'ham Forest": "Nott'm Forest",
     "Nottingham Forest": "Nott'm Forest",
 }
@@ -244,13 +249,14 @@ def render(db_path: Path):
         np.where(merged["gpt_winner"] == "A", merged["away_team"], "Draw")
     )
 
-    merged["gemini_winner_team"] = np.where(
-        merged["gemini_winner"] == "H", merged["home_team"],
-        np.where(
-            merged["gemini_winner"] == "A", merged["away_team"],
-            np.where(merged["gemini_winner"] == "D", "Draw", np.nan)
-        )
-    )
+    merged["gemini_winner_team"] = pd.Series(index=merged.index, dtype="object")
+    merged.loc[merged["gemini_winner"] == "H", "gemini_winner_team"] = merged.loc[
+        merged["gemini_winner"] == "H", "home_team"
+    ]
+    merged.loc[merged["gemini_winner"] == "A", "gemini_winner_team"] = merged.loc[
+        merged["gemini_winner"] == "A", "away_team"
+    ]
+    merged.loc[merged["gemini_winner"] == "D", "gemini_winner_team"] = "Draw"
 
     # --------------------------------------------------------
     # CORRECTNESS
@@ -306,7 +312,7 @@ def render(db_path: Path):
     })
 
     st.markdown("### Accuracy Summary (Past 30 Days)")
-    st.dataframe(accuracy_df.round(2), use_container_width=True)
+    st.dataframe(accuracy_df.round(2), width="stretch")
 
     # --------------------------------------------------------
     # FINAL DISPLAY (UNCHANGED)
@@ -355,5 +361,5 @@ def render(db_path: Path):
                 "gemini_score_correct",
             ],
         ),
-        use_container_width=True,
+        width="stretch",
     )

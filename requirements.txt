@@ -3,3 +3,9 @@ numpy
 scipy
 scikit-learn
 pyyaml
+openai
+python-dotenv
+google-genai
+requests
+streamlit
+plotly

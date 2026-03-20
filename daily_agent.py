@@ -14,7 +14,6 @@ from datetime import datetime, timezone
 ROOT = Path(__file__).resolve().parent
 FULL_PIPELINE = ROOT / "scripts" / "full_pipeline.py"
 
-
 def main():
     start = datetime.now(timezone.utc)
     print("=" * 75)
